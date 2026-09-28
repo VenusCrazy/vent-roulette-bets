@@ -8,7 +8,7 @@
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "test": "node --test backend/ src/lib/",
+    "test": "node --test backend/ src/lib/ src/hooks/",
     "mock": "node backend/mock-server.mjs"
   },
   "dependencies": {

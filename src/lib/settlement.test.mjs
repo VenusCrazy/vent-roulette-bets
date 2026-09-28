@@ -13,8 +13,22 @@ test('a declared losing vent is paid nothing', () => {
   assert.deepEqual(computeSettlement(150, 5, 1, [3, 5]), { outcome: 'lost', payout: 0 })
 })
 
-test('a neutral vent is refunded its full stake, not zero', () => {
-  assert.deepEqual(computeSettlement(75, 9, 1, [3, 5]), { outcome: 'refunded', payout: 75 })
+test('a neutral vent loses its stake, the same as a declared losing vent', () => {
+  assert.deepEqual(computeSettlement(75, 9, 1, [3, 5]), { outcome: 'lost', payout: 0 })
+})
+
+test('only the winning vent is ever paid, so six of the nine vents lose', () => {
+  const winner = 4
+  const losers = [2, 7]
+  const outcomes = []
+  for (let vent = 1; vent <= 9; vent++) outcomes.push(computeSettlement(100, vent, winner, losers).outcome)
+  assert.deepEqual(
+    outcomes.filter((o) => o === 'won').length,
+    1,
+    'exactly one vent wins'
+  )
+  assert.equal(outcomes.filter((o) => o === 'lost').length, 8, 'the other eight lose')
+  assert.ok(!outcomes.includes('refunded'), 'nothing is refunded')
 })
 
 test('every vent 1-9 gets a result for any winner/loser set', () => {
@@ -22,7 +36,7 @@ test('every vent 1-9 gets a result for any winner/loser set', () => {
   const losers = [2, 7]
   for (let vent = 1; vent <= 9; vent++) {
     const { outcome, payout } = computeSettlement(100, vent, winner, losers)
-    assert.ok(['won', 'lost', 'refunded'].includes(outcome), `vent ${vent} got ${outcome}`)
+    assert.ok(['won', 'lost'].includes(outcome), `vent ${vent} got ${outcome}`)
     assert.ok(Number.isFinite(payout) && payout >= 0, `vent ${vent} payout ${payout}`)
   }
 })

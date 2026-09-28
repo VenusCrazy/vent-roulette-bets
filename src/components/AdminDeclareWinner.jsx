@@ -17,7 +17,7 @@ function computePreview(bets, winner, losers) {
 
   return {
     rows,
-    refunded: rows.filter((row) => row.outcome === 'refunded').length,
+    won: rows.filter((row) => row.outcome === 'won').length,
     lost: rows.filter((row) => row.outcome === 'lost').length,
   }
 }
@@ -25,13 +25,11 @@ function computePreview(bets, winner, losers) {
 const RESULT_STYLES = {
   won: 'text-emerald-400',
   lost: 'text-red-400',
-  refunded: 'text-sky-300',
 }
 
 const RESULT_LABELS = {
   won: 'Won',
   lost: 'Lost',
-  refunded: 'Refunded',
 }
 
 function VentSelect({ id, label, hint, value, options, disabledOptions, accent, onChange }) {
@@ -79,8 +77,6 @@ export default function AdminDeclareWinner({
   vents = [],
   ventName = ventLabel,
   picks,
-  adminKey = '',
-  onAdminKeyChange,
   onPick,
   reviewing = false,
   onStartReview,
@@ -166,20 +162,6 @@ export default function AdminDeclareWinner({
           />
         </div>
 
-        <div className="flex flex-col gap-2">
-          <label htmlFor="admin-key" className="text-sm font-semibold text-slate-200">
-            Admin key
-          </label>
-          <input
-            id="admin-key"
-            type="password"
-            autoComplete="current-password"
-            value={adminKey}
-            onChange={(event) => onAdminKeyChange(event.target.value)}
-            className={selectClass}
-          />
-        </div>
-
         {/* Live preview of the Payout column Code.gs will write for each team. */}
         {preview ? (
           <div className="rounded-xl border border-gold/30 bg-gold/[0.04] p-4">
@@ -188,7 +170,7 @@ export default function AdminDeclareWinner({
                 Payout — {ventName(winner)} wins
               </h3>
               <span className="text-xs text-slate-400">
-                <strong className="text-gold">{preview.rows.length}</strong> bet(s) this round
+                  <strong className="text-gold">{preview.rows.length}</strong> bet(s) this round
               </span>
             </div>
 
@@ -223,15 +205,16 @@ export default function AdminDeclareWinner({
               </table>
             </div>
 
-            {preview.refunded > 0 ? (
+            {preview.won > 0 ? (
               <p className="mt-3 text-xs text-slate-400">
-                {preview.refunded} bet(s) are on a vent that is neither the winner nor a declared
-                loser — those stakes are refunded.
+                {preview.won} bet(s) on vent {ventName(winner)} are credited twice their stake.
+                Everyone else keeps nothing.
               </p>
             ) : null}
             {preview.lost > 0 ? (
               <p className="mt-1 text-xs text-slate-400">
-                {preview.lost} bet(s) are on a declared losing vent and are paid nothing further.
+                {preview.lost} bet(s) are paid nothing. The two declared losers lose their stake, and
+                so does a vent that neither won nor lost — there are no refunds this round.
               </p>
             ) : null}
           </div>
@@ -255,7 +238,7 @@ export default function AdminDeclareWinner({
             {resolution && resolution.rows.length > 0 ? (
               <div className="mt-3 border-t border-green-500/20 pt-2">
                 <p className="mb-2 text-xs font-semibold text-green-200">
-                  Written to the sheet ({resolution.rows.length} team(s)):
+                  Credited to the score column ({resolution.rows.length} team(s)):
                 </p>
                 <div className="overflow-x-auto">
                   <table className="w-full text-left text-xs text-green-100">
@@ -300,7 +283,11 @@ export default function AdminDeclareWinner({
             <p className="mt-2 text-sm text-slate-200">
               Winning Vent {winner}, losing Vents {loser1} and {loser2}. Confirm?
             </p>
-            <p className="mt-2 text-xs text-slate-400">This cannot be undone.</p>
+            <p className="mt-2 text-xs text-slate-400">
+              This credits every bet on Vent {winner} with twice its stake, pays nothing to the
+              rest, archives the round and advances it. The stakes were already taken when the
+              bets were placed, so it only adds to the balances now — it cannot be undone.
+            </p>
 
             <div className="mt-4 flex flex-col gap-3 sm:flex-row">
               <button

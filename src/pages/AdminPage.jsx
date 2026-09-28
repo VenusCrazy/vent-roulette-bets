@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import AdminDeclareWinner from '../components/AdminDeclareWinner.jsx'
 import { VENTS, VENT_MIN, VENT_MAX } from '../config/gameConfig.js'
-import { declareResult, getBets } from '../api/betting.js'
+import { declareResult, getBets, resetRound } from '../api/betting.js'
 import amongus from '../assets/amonguscharacter.png'
 
 const EMPTY_PICKS = { winner: null, loser1: null, loser2: null }
@@ -22,13 +22,18 @@ export default function AdminPage() {
   const [picks, setPicks] = useState(EMPTY_PICKS)
   const [reviewing, setReviewing] = useState(false)
   const [confirming, setConfirming] = useState(false)
-  const [adminKey, setAdminKey] = useState('')
   const [result, setResult] = useState(null)
   const [error, setError] = useState('')
   const [currentBets, setCurrentBets] = useState([])
   const [round, setRound] = useState(null)
   const [loadingBets, setLoadingBets] = useState(true)
   const [lastResolvedBets, setLastResolvedBets] = useState(null)
+
+  // The refresh (archive & clear) control has its own two-step confirm, so it
+  // can never be fired by accident mid-declaration.
+  const [refreshArmed, setRefreshArmed] = useState(false)
+  const [refreshBusy, setRefreshBusy] = useState(false)
+  const [refreshMessage, setRefreshMessage] = useState('')
 
   const refreshBets = useCallback(async () => {
     const data = await getBets()
@@ -118,7 +123,6 @@ export default function AdminPage() {
         winningVent: winner,
         losingVent1: loser1,
         losingVent2: loser2,
-        adminKey,
       })
       const nextRound = Number.isInteger(data?.nextRound) ? data.nextRound : null
       setResult(
@@ -127,7 +131,6 @@ export default function AdminPage() {
       )
       setLastResolvedBets({ winner, losers: [loser1, loser2], bets: betsForResolution })
       setPicks(EMPTY_PICKS)
-      setAdminKey('')
       setReviewing(false)
       await fetchBets()
     } catch (err) {
@@ -136,7 +139,34 @@ export default function AdminPage() {
     } finally {
       setConfirming(false)
     }
-  }, [picks, confirming, currentBets, adminKey, fetchBets])
+  }, [picks, confirming, currentBets, fetchBets])
+
+  // First click arms the button; the second actually archives and clears.
+  const handleRefreshRound = useCallback(async () => {
+    if (refreshBusy) return
+    if (!refreshArmed) {
+      setRefreshArmed(true)
+      setRefreshMessage('')
+      return
+    }
+    setRefreshBusy(true)
+    setRefreshMessage('')
+    try {
+      const data = await resetRound()
+      setRefreshMessage(
+        data.archived
+          ? `Archived ${data.archived} bet(s) and started the next round. Points are untouched.`
+          : 'Nothing to archive — no bets are live.'
+      )
+      setRefreshArmed(false)
+      await fetchBets()
+    } catch (err) {
+      setRefreshMessage(err?.message ?? 'Connection error — try again')
+      setRefreshArmed(false)
+    } finally {
+      setRefreshBusy(false)
+    }
+  }, [refreshArmed, refreshBusy, fetchBets])
 
   return (
     <div className="mx-auto max-w-4xl">
@@ -146,8 +176,8 @@ export default function AdminPage() {
           Declare Result
         </h1>
         <p className="mt-3 text-slate-400">
-          Name the vent that carried the day and the two that lost. Results are written straight to
-          the sheet.
+          Name the vent that carried the day and the two that lost. The winner&apos;s bets are
+          credited twice their stake, and everyone else keeps nothing.
         </p>
         <div
           aria-hidden
@@ -159,8 +189,6 @@ export default function AdminPage() {
         vents={VENTS}
         ventName={ventName}
         picks={picks}
-        adminKey={adminKey}
-        onAdminKeyChange={setAdminKey}
         onPick={handlePick}
         reviewing={reviewing}
         onStartReview={handleStartReview}
@@ -175,6 +203,52 @@ export default function AdminPage() {
         lastResolvedBets={lastResolvedBets}
         round={round}
       />
+
+      <section className="mt-6 rounded-2xl border border-white/15 bg-abyss-950/60 backdrop-blur-sm">
+        <header className="border-b border-white/10 px-5 py-4">
+          <h2 className="font-display font-bold text-2xl tracking-wide text-slate-200">
+            Refresh Round
+          </h2>
+          <p className="mt-1 text-xs text-slate-400">
+            Archives the live round and starts the next one. Nothing is settled and no points
+            move — declaring a result does that. Stakes already taken stay deducted until the
+            round is declared.
+          </p>
+        </header>
+        <div className="flex flex-col gap-4 p-5">
+          {refreshMessage ? (
+            <p
+              role="status"
+              className="rounded-xl border border-white/15 bg-white/5 px-4 py-3 text-sm text-slate-200"
+            >
+              {refreshMessage}
+            </p>
+          ) : null}
+
+          <button
+            type="button"
+            onClick={handleRefreshRound}
+            disabled={refreshBusy}
+            className={`flex w-full items-center justify-center gap-2 rounded-xl px-5 py-3 font-display font-bold tracking-wide transition-all disabled:cursor-not-allowed disabled:opacity-50 ${
+              refreshArmed
+                ? 'bg-gradient-to-r from-flame-dark via-flame to-flame-dark text-white hover:brightness-110'
+                : 'border border-white/15 bg-white/5 text-slate-200 hover:bg-white/10'
+            }`}
+          >
+            {refreshBusy ? (
+              <span
+                aria-hidden
+                className="h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white"
+              />
+            ) : null}
+            {refreshBusy
+              ? 'Archiving…'
+              : refreshArmed
+                ? 'Click again to archive & clear'
+                : '↻ Refresh round'}
+          </button>
+        </div>
+      </section>
     </div>
   )
 }

@@ -1,8 +1,8 @@
 export const TEAMS = ['Jack Sparrow', 'Will Turner', 'Hector Barbossa', 'Elizabeth Swan']
 
 // The nine selectable vents. A bet's target is the vent NUMBER (1-9) —
-// this is the value sent in the payload and written to the sheet.
-// Mirrors MIN_VENT / MAX_VENT in backend/Code.gs; keep both in step.
+// this is the value sent in the payload and stored in the round.
+// Mirrors CONFIG.VENTS in backend/Code.gs; keep both in step.
 export const VENT_MIN = 1
 export const VENT_MAX = 9
 

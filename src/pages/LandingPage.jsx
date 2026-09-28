@@ -1,58 +1,17 @@
-import { useCallback, useEffect, useState } from 'react'
 import Header from '../components/Header.jsx'
 import StatCard from '../components/StatCard.jsx'
 import BetForm from '../components/BetForm.jsx'
 import BetsTable from '../components/BetsTable.jsx'
-import { getBets, placeBet } from '../api/betting.js'
+import useBets from '../hooks/useBets.js'
+import { getScore, placeBet } from '../api/betting.js'
 import amongus from '../assets/amonguscharacter.png'
 
-const POLL_INTERVAL_MS = 15000
-
 export default function LandingPage() {
-  const [bets, setBets] = useState([])
-  const [stats, setStats] = useState({ totalPoints: 0, activeBets: 0 })
-  const [round, setRound] = useState(null)
-  const [loadingBets, setLoadingBets] = useState(true)
-  const [refreshing, setRefreshing] = useState(false)
-  const [betsError, setBetsError] = useState('')
-
-  const refreshCurrentBets = useCallback(async () => {
-    try {
-      const data = await getBets()
-      setBets(Array.isArray(data?.bets) ? data.bets : [])
-      setStats({
-        totalPoints: data?.totalPoints ?? 0,
-        activeBets: data?.activeBets ?? 0,
-      })
-      setRound(Number.isInteger(data?.round) ? data.round : null)
-      setBetsError('')
-    } catch (error) {
-      setBetsError(error?.message ?? 'Could not refresh bets.')
-    } finally {
-      setLoadingBets(false)
-    }
-  }, [])
-
-  useEffect(() => {
-    const timer = setInterval(() => {
-      if (document.visibilityState === 'visible') refreshCurrentBets()
-    }, POLL_INTERVAL_MS)
-    Promise.resolve().then(refreshCurrentBets)
-    return () => clearInterval(timer)
-  }, [refreshCurrentBets])
-
-  async function handleRefresh() {
-    setRefreshing(true)
-    try {
-      await refreshCurrentBets()
-    } finally {
-      setRefreshing(false)
-    }
-  }
+  const { round, totalPoints, activeBets, bets, loading, error, refresh } = useBets()
 
   async function handlePlaceBet(bet) {
     const data = await placeBet(bet)
-    await refreshCurrentBets()
+    await refresh()
     return data
   }
 
@@ -63,14 +22,14 @@ export default function LandingPage() {
       <section className="mt-12 grid grid-cols-1 gap-4 sm:grid-cols-2">
         <StatCard
           label="Total Bets"
-          value={stats.totalPoints}
+          value={totalPoints}
           icon="🪙"
           suffix="points"
           accent="gold"
         />
         <StatCard
           label="Active Bets"
-          value={stats.activeBets}
+          value={activeBets}
           suffix="bets"
           accent="ocean"
         />
@@ -85,7 +44,7 @@ export default function LandingPage() {
             </h2>
           </header>
           <div className="p-5">
-            <BetForm onPlaceBet={handlePlaceBet} />
+            <BetForm onPlaceBet={handlePlaceBet} onGetScore={getScore} />
           </div>
         </div>
 
@@ -101,13 +60,13 @@ export default function LandingPage() {
             ) : null}
             <button
               type="button"
-              onClick={handleRefresh}
+              onClick={refresh}
               title="Refresh bets"
               aria-label="Refresh bets"
-              disabled={refreshing}
+              disabled={loading}
               className="ml-auto grid h-8 w-8 place-items-center rounded-lg border border-ocean/40 bg-ocean/10 text-ocean-light transition-colors hover:bg-ocean/20 disabled:opacity-50"
             >
-              {refreshing ? (
+              {loading ? (
                 <span aria-hidden className="h-4 w-4 animate-spin rounded-full border-2 border-ocean-light/30 border-t-ocean-light" />
               ) : (
                 '↻'
@@ -115,15 +74,15 @@ export default function LandingPage() {
             </button>
           </header>
           <div className="p-5">
-            {betsError ? (
+            {error ? (
               <div
                 role="alert"
                 className="mb-4 rounded-xl border border-flame/40 bg-flame/10 px-4 py-3 text-sm text-red-300"
               >
-                ⚠️ {betsError}
+                ⚠️ {error}
               </div>
             ) : null}
-            <BetsTable bets={bets} loading={loadingBets} />
+            <BetsTable bets={bets} loading={loading} />
           </div>
         </div>
       </section>

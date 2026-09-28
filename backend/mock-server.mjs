@@ -1,8 +1,11 @@
 // Dev-only mock of the deployed Apps Script endpoint.
-// Loads the REAL backend/Code.gs against an in-memory workbook so the browser
+// Loads the REAL backend/Code.gs against an in-memory spreadsheet so the browser
 // exercises the genuine code path. Not part of the app build.
 //
 //   node backend/mock-server.mjs          # serves on :8787
+//
+// Two workbooks are faked, like the real deployment: the script is bound to
+// "Vent-Roulette" and reaches the teams through openById().
 import http from 'node:http'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -11,20 +14,18 @@ import { dirname, join } from 'node:path'
 const here = dirname(fileURLToPath(import.meta.url))
 const source = readFileSync(join(here, 'Code.gs'), 'utf8')
 
-// Every cell is stored wrapped ({ value }) so a formula cell stays
-// distinguishable from a literal one, which setBalance_ relies on.
-const wrap = (v) => ({ value: v })
-const unwrap = (v) => (v && typeof v === 'object' && 'value' in v ? v.value : v)
-
 class FakeRange {
   constructor(sheet, row, col, numRows = 1, numCols = 1) {
     Object.assign(this, { sheet, row, col, numRows, numCols })
   }
-  _read(r, c) { return unwrap(this.sheet.data[r - 1]?.[c - 1]) }
+  _read(r, c) {
+    const v = this.sheet.data[r - 1]?.[c - 1]
+    return v === undefined ? '' : v
+  }
   _write(r, c, v) {
     while (this.sheet.data.length <= r - 1) this.sheet.data.push([])
-    while (this.sheet.data[r - 1].length <= c - 1) this.sheet.data[r - 1].push(wrap(''))
-    this.sheet.data[r - 1][c - 1] = wrap(v)
+    while (this.sheet.data[r - 1].length <= c - 1) this.sheet.data[r - 1].push('')
+    this.sheet.data[r - 1][c - 1] = v
   }
   getValues() {
     const out = []
@@ -36,102 +37,108 @@ class FakeRange {
     return out
   }
   getValue() { return this._read(this.row, this.col) }
-  getFormula() {
-    const cell = this.sheet.data[this.row - 1]?.[this.col - 1]
-    return cell && typeof cell === 'object' ? cell.formula || '' : ''
-  }
-  setValue(v) { this._write(this.row, this.col, v); return this }
-  setValues(values) {
-    values.forEach((row, ri) => row.forEach((v, ci) => this._write(this.row + ri, this.col + ci, v)))
-    return this
-  }
-  clearContent() {
-    for (let r = 0; r < this.numRows; r++) {
-      for (let c = 0; c < this.numCols; c++) this._write(this.row + r, this.col + c, '')
-    }
+  getFormula() { return this.sheet.formulas.get(this.row + ',' + this.col) || '' }
+  setValue(v) {
+    this.sheet.formulas.delete(this.row + ',' + this.col)
+    this._write(this.row, this.col, v)
     return this
   }
 }
 
 class FakeSheet {
-  constructor(name, data) { this.name = name; this.data = data.map((r) => r.map(wrap)) }
+  constructor(name, data, sheetId = 0) {
+    this.name = name; this.data = data; this.sheetId = sheetId; this.formulas = new Map()
+  }
   getName() { return this.name }
+  getSheetId() { return this.sheetId }
   getLastRow() { return this.data.length }
+  getLastColumn() {
+    let last = 0
+    for (const row of this.data) {
+      for (let c = 0; c < row.length; c++) {
+        if (String(row[c] ?? '').trim()) last = Math.max(last, c + 1)
+      }
+    }
+    return last
+  }
   getRange(row, col, numRows = 1, numCols = 1) {
     return new FakeRange(this, row, col, numRows, numCols)
   }
-  appendRow(row) { this.data.push(row.map(wrap)); return this }
-  setFrozenRows() { return this }
+  appendRow(row) { this.data.push(row.slice()); return this }
 }
 
 class FakeSpreadsheet {
-  constructor(sheets) { this.byName = new Map(sheets.map((s) => [s.getName(), s])) }
+  constructor(name, sheets) {
+    this.name = name
+    this.sheets = sheets
+    this.byName = new Map(sheets.map((s) => [s.getName(), s]))
+  }
+  getName() { return this.name }
+  getUrl() { return 'http://localhost:8787/' + encodeURIComponent(this.name) }
+  getSheets() { return this.sheets }
   getSheetByName(name) { return this.byName.get(name) ?? null }
   insertSheet(name) {
-    const sheet = new FakeSheet(name, [[]])
+    const sheet = new FakeSheet(name, [], this.sheets.length + 1)
+    this.sheets.push(sheet)
     this.byName.set(name, sheet)
     return sheet
   }
 }
 
-const BET_HEADER = [
-  'Team Name', 'Team Code', '', 'Points BET',
-  'VentChosen', 'Points After Bet', 'Result', 'Payout',
-]
+// The main spreadsheet, reached by ID: row 1 headers, teams from row 2,
+// A Team Code, B Team Name, C Score. A few activity columns follow, like the
+// real sheet, but nothing reads them.
+const scoreSheet = new FakeSheet('Sheet1', [
+  ['Team Code', 'Team Name', 'Score'],
+  ['1092', 'Alpha', 1000, 120, 80, 90],
+  ['2424', 'Bravo', 1000, 140, 60, 75],
+  ['2324', 'Charlie', 1000, 100, 95, 85],
+  ['3232', 'Delta', 1000, 160, 70, 55],
+  ['4141', 'Echo', 1000, 110, 90, 95],
+])
+const scoreBook = new FakeSpreadsheet('Main Spreadsheet', [scoreSheet])
 
-// CurrentRound holds the team roster; column D stays empty until a bet lands.
-const ROSTER = [
-  ['Alpha', '1092'], ['Bravo', '2424'], ['Charlie', '2324'],
-  ['Delta', '3232'], ['Echo', '4141'],
-]
-const betSheet = new FakeSheet('CurrentRound', [
-  BET_HEADER,
-  ...ROSTER.map(([name, code]) => [name, code, '', '', '', '', '', '']),
+// The workbook the script is bound to. Deliberately has no team data.
+const boundBook = new FakeSpreadsheet('Vent-Roulette', [
+  new FakeSheet('Betting Sheet', [['Team Name', 'TeamCode', '', 'Points BET']]),
 ])
 
-// Request 5.0: code in B, score in S.
-const mainRow = (code, score) => {
-  const row = new Array(19).fill('')
-  row[1] = code
-  row[18] = score
-  return row
+// Script properties, holding the live round.
+const store = new Map()
+const properties = {
+  getProperty: (k) => (store.has(k) ? store.get(k) : null),
+  setProperty: (k, v) => { store.set(k, String(v)) },
+  deleteProperty: (k) => { store.delete(k) },
 }
-const mainSheet = new FakeSheet('Request 5.0', [
-  new Array(19).fill(''),
-  mainRow('1092', 1000), mainRow('2424', 1000), mainRow('2324', 1000),
-  mainRow('3232', 1000), mainRow('4141', 1000),
-])
-
-const ss = new FakeSpreadsheet([betSheet, mainSheet])
-const store = { ADMIN_KEY: 'devkey' }
 
 const load = new Function(
   'SpreadsheetApp',
   'ContentService',
-  'PropertiesService',
   'LockService',
+  'PropertiesService',
+  'Logger',
   `${source}
   return { doGet, doPost, CONFIG };`
 )
 const api = load(
-  { getActive: () => ss },
+  {
+    getActive: () => boundBook,
+    openById: () => scoreBook,
+  },
   {
     MimeType: { JSON: 'application/json' },
     createTextOutput: (text) => ({ text, setMimeType() { return this } }),
   },
-  {
-    getScriptProperties: () => ({
-      getProperty: (k) => (k in store ? store[k] : null),
-      setProperty: (k, v) => { store[k] = String(v) },
-    }),
-  },
-  { getScriptLock: () => ({ waitLock() {}, releaseLock() {} }) }
+  { getScriptLock: () => ({ waitLock() {}, releaseLock() {} }) },
+  { getScriptProperties: () => properties },
+  { log: (...args) => console.log('[sheet]', ...args) }
 )
 
-// Seed a round through the real placeBet path, spread across the vent range
-// so a declaration has a realistic mix of winner, loser and refunded bets.
+// Seed a round through the real placeBet path, spread across the vent range so
+// a declaration has a realistic mix of winner and loser.
 for (const [code, amount, vent] of [['1092', 200, 1], ['2424', 150, 3], ['2324', 100, 5], ['4141', 75, 9]]) {
-  api.doPost({ postData: { contents: JSON.stringify({ action: 'placeBet', teamCode: code, amount, vent }) } })
+  const out = JSON.parse(api.doPost({ postData: { contents: JSON.stringify({ action: 'placeBet', teamCode: code, amount, vent }) } }).text)
+  if (!out.ok) console.log('[seed] skipped', code, out.error)
 }
 
 const server = http.createServer((req, res) => {
