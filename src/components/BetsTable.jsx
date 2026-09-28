@@ -1,14 +1,9 @@
 import amongus from '../assets/amonguscharacter.png'
+import { ventLabel } from '../config/gameConfig.js'
 
-const DOT = {
-  red: 'bg-red-500',
-  yellow: 'bg-yellow-400',
-  blue: 'bg-blue-500',
-  green: 'bg-green-500',
-}
-
-const capitalize = (value) =>
-  value ? value.charAt(0).toUpperCase() + value.slice(1) : ''
+// Tolerates a value that isn't a clean 1-9 so one bad cell can't blank the
+// table. Valid bets always store the number.
+const ventText = (vent) => (vent == null || vent === '' ? '—' : ventLabel(vent))
 
 export default function BetsTable({ bets = [], loading = false }) {
   if (loading && bets.length === 0) {
@@ -41,30 +36,18 @@ export default function BetsTable({ bets = [], loading = false }) {
                 aria-hidden
                 className="mr-1 -mt-0.5 inline-block h-3 w-3 object-contain"
               />
-              Team ID
+              Team Name
             </th>
-            <th className="pb-3 pr-3 font-semibold">Spacewalker</th>
+            <th className="pb-3 pr-3 font-semibold">Target Vent</th>
             <th className="pb-3 font-semibold">Bet Amount</th>
           </tr>
         </thead>
         <tbody>
           {bets.map((bet, index) => (
-            <tr key={bet.id ?? `${bet.spacewalker}-${bet.betAmount}-${index}`} className="border-t border-white/10 align-top">
-              <td className="py-3 pr-3">
-                <span className="font-semibold text-white">{bet.id}</span>
-                {bet.name ? (
-                  <span className="mt-0.5 block text-xs text-slate-500">{bet.name}</span>
-                ) : null}
-              </td>
-              <td className="py-3 pr-3 text-slate-300">
-                <span
-                  className={`mr-2 inline-block h-2.5 w-2.5 rounded-full ${
-                    DOT[bet.spacewalker] ?? 'bg-slate-400'
-                  }`}
-                />
-                {capitalize(bet.spacewalker)}
-              </td>
-              <td className="py-3 font-semibold text-gold-light">{bet.betAmount}</td>
+            <tr key={`${bet.teamName}-${bet.vent}-${index}`} className="border-t border-white/10 align-top">
+              <td className="py-3 pr-3 font-semibold text-white">{bet.teamName}</td>
+              <td className="py-3 pr-3 text-slate-300">{ventText(bet.vent)}</td>
+              <td className="py-3 font-semibold text-gold-light">{bet.amount}</td>
             </tr>
           ))}
         </tbody>

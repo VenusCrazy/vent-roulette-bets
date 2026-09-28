@@ -28,6 +28,7 @@ export default function SelectableGrid({
   onSelect,
   columns = 2,
   accent = 'gold',
+  getLabel = (option) => String(option),
 }) {
   const a = ACCENTS[accent] ?? ACCENTS.gold
   return (
@@ -43,17 +44,17 @@ export default function SelectableGrid({
             type="button"
             aria-pressed={isSelected}
             onClick={() => onSelect(option)}
-            className={`rounded-xl border px-3 py-2.5 text-sm font-medium transition-all ${
+            className={`rounded-xl border px-2 py-2 text-xs font-medium transition-all sm:px-3 sm:py-2.5 sm:text-sm ${
               isSelected ? a.selected : a.unselected
             }`}
           >
-            <span className="flex items-center justify-center gap-1.5">
+            <span className="flex items-center justify-center gap-1">
               {isSelected ? (
                 <span aria-hidden className={a.check}>
                   ✔
                 </span>
               ) : null}
-              {option}
+              {getLabel(option)}
             </span>
           </button>
         )

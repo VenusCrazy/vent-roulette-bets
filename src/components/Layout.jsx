@@ -22,7 +22,7 @@ export default function Layout({ children }) {
         <div className="mx-auto flex w-full max-w-6xl items-center justify-between px-4 py-3">
           <NavLink to="/" className={brandLinkClass}>
             <img src={amongus} alt="" aria-hidden className="h-6 w-6 object-contain" />
-            <span className="font-display text-xl tracking-wide text-gradient-gold">
+            <span className="font-display font-bold text-xl tracking-wide text-gradient-gold">
               {APP_NAME}
             </span>
           </NavLink>

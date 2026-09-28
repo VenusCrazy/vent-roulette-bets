@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import SelectableGrid from './SelectableGrid.jsx'
-import { SPACEWALKERS } from '../config/gameConfig.js'
+import { VENTS, ventLabel } from '../config/gameConfig.js'
+import { validateBetInput } from '../api/betting.js'
 
 const inputClass =
   'w-full rounded-xl border border-white/10 bg-abyss-900/60 px-3.5 py-2.5 text-sm text-white placeholder:text-slate-500 outline-none transition-colors focus:border-gold/60'
@@ -9,30 +10,54 @@ const labelClass = 'mb-1.5 block text-xs font-semibold uppercase tracking-widest
 
 export default function BetForm({ onPlaceBet }) {
   const [participantId, setParticipantId] = useState('')
-  const [spacewalker, setSpacewalker] = useState('')
+  const [vent, setVent] = useState(null)
   const [betAmount, setBetAmount] = useState('')
   const [status, setStatus] = useState('idle')
   const [message, setMessage] = useState('')
-  const [remaining, setRemaining] = useState(null)
 
-  const isValid = participantId.trim() !== '' && spacewalker !== '' && Number(betAmount) > 0
   const busy = status === 'submitting'
+
+  function selectVent(value) {
+    setVent(value)
+    setMessage('')
+    setStatus('idle')
+  }
+
+  function updateInput(setter, value) {
+    setter(value)
+    setMessage('')
+    setStatus('idle')
+  }
 
   async function handleSubmit(event) {
     event.preventDefault()
-    if (!isValid || busy) return
+    if (busy) return
+
+    const validationError = validateBetInput({
+      teamCode: participantId,
+      amount: betAmount,
+      vent,
+    })
+    if (validationError) {
+      setStatus('error')
+      setMessage(validationError)
+      return
+    }
+
     setStatus('submitting')
     setMessage('')
-    setRemaining(null)
     try {
       const data = await onPlaceBet({
-        participantId: participantId.trim(),
-        betAmount: Number(betAmount),
-        spacewalker: spacewalker.toLowerCase(),
+        teamCode: participantId.trim(),
+        amount: Number(betAmount),
+        vent,
       })
       setStatus('success')
-      setMessage(data.message ?? 'Bet placed!')
-      setRemaining(data.remaining)
+      setMessage(
+        data.pointsAfterBet != null
+          ? `Bet placed! New balance: ${data.pointsAfterBet} points.`
+          : 'Bet placed successfully.'
+      )
       setParticipantId('')
       setBetAmount('')
     } catch (error) {
@@ -51,7 +76,7 @@ export default function BetForm({ onPlaceBet }) {
           id="participant-id"
           type="text"
           value={participantId}
-          onChange={(e) => setParticipantId(e.target.value)}
+          onChange={(e) => updateInput(setParticipantId, e.target.value)}
           placeholder="e.g., 1002"
           autoComplete="off"
           className={inputClass}
@@ -68,31 +93,27 @@ export default function BetForm({ onPlaceBet }) {
           min="1"
           step="1"
           value={betAmount}
-          onChange={(e) => setBetAmount(e.target.value)}
+          onChange={(e) => updateInput(setBetAmount, e.target.value)}
           placeholder="e.g., 100"
           className={inputClass}
         />
       </div>
 
       <div>
-        <p className={labelClass}>Target Spacewalker</p>
+        <p className={labelClass}>Target Vent</p>
         <SelectableGrid
-          options={SPACEWALKERS}
-          selected={spacewalker}
-          onSelect={setSpacewalker}
+          options={VENTS}
+          columns={3}
+          selected={vent}
+          onSelect={selectVent}
+          getLabel={ventLabel}
           accent="ocean"
         />
       </div>
 
-      {remaining !== null ? (
-        <div className="rounded-xl border border-ocean/40 bg-ocean/10 px-4 py-3 text-sm text-ocean-light">
-          🪙 Remaining score: {remaining}
-        </div>
-      ) : null}
-
       {status !== 'idle' && message ? (
         <div
-          role="status"
+          role={status === 'error' ? 'alert' : 'status'}
           className={`mt-1 rounded-xl border px-4 py-3 text-sm ${
             status === 'success'
               ? 'border-green-500/40 bg-green-500/10 text-green-300'
@@ -106,8 +127,8 @@ export default function BetForm({ onPlaceBet }) {
 
       <button
         type="submit"
-        disabled={!isValid || busy}
-        className="shadow-gold-glow mt-1 flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-gold-light via-gold to-flame px-5 py-3.5 font-display text-xl tracking-wide text-abyss-950 transition-all hover:brightness-110 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-50"
+        disabled={busy}
+        className="shadow-gold-glow mt-1 flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-gold-light via-gold to-flame px-5 py-3.5 font-display font-bold text-xl tracking-wide text-abyss-950 transition-all hover:brightness-110 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-50"
       >
         {busy ? (
           <span
@@ -115,7 +136,7 @@ export default function BetForm({ onPlaceBet }) {
             className="h-4 w-4 animate-spin rounded-full border-2 border-abyss-950/30 border-t-abyss-950"
           />
         ) : null}
-        {busy ? 'Placing bet…' : 'Place Bet & Deduct Score'}
+        {busy ? 'Placing bet…' : 'Place Bet'}
       </button>
     </form>
   )

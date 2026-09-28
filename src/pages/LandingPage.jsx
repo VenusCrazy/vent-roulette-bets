@@ -3,57 +3,41 @@ import Header from '../components/Header.jsx'
 import StatCard from '../components/StatCard.jsx'
 import BetForm from '../components/BetForm.jsx'
 import BetsTable from '../components/BetsTable.jsx'
-import { placeBet, getLeaderboard, getCurrentBets } from '../api.js'
+import { getBets, placeBet } from '../api/betting.js'
 import amongus from '../assets/amonguscharacter.png'
 
-const POLL_INTERVAL_MS = 20000
+const POLL_INTERVAL_MS = 15000
 
 export default function LandingPage() {
   const [bets, setBets] = useState([])
-  const [stats, setStats] = useState({ totalBets: 0, activeBets: 0 })
+  const [stats, setStats] = useState({ totalPoints: 0, activeBets: 0 })
+  const [round, setRound] = useState(null)
   const [loadingBets, setLoadingBets] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
+  const [betsError, setBetsError] = useState('')
 
   const refreshCurrentBets = useCallback(async () => {
     try {
-      const data = await getCurrentBets()
+      const data = await getBets()
       setBets(Array.isArray(data?.bets) ? data.bets : [])
       setStats({
-        totalBets: data?.totalBets ?? 0,
+        totalPoints: data?.totalPoints ?? 0,
         activeBets: data?.activeBets ?? 0,
       })
+      setRound(Number.isInteger(data?.round) ? data.round : null)
+      setBetsError('')
     } catch (error) {
-      console.error('ReQuest current bets refresh failed:', error?.message)
+      setBetsError(error?.message ?? 'Could not refresh bets.')
     } finally {
       setLoadingBets(false)
     }
   }, [])
 
   useEffect(() => {
-    getLeaderboard()
-      .then(() => console.info('ReQuest backend connected.'))
-      .catch((error) => {
-        console.error(
-          `ReQuest backend unreachable — check VITE_APPS_SCRIPT_URL (${import.meta.env.VITE_APPS_SCRIPT_URL ?? 'not set'}):`,
-          error?.message
-        )
-      })
-    getCurrentBets()
-      .then((data) => {
-        setBets(Array.isArray(data?.bets) ? data.bets : [])
-        setStats({
-          totalBets: data?.totalBets ?? 0,
-          activeBets: data?.activeBets ?? 0,
-        })
-      })
-      .catch((error) => {
-        console.error('ReQuest current bets refresh failed:', error?.message)
-      })
-      .finally(() => setLoadingBets(false))
     const timer = setInterval(() => {
-      refreshCurrentBets()
-      getLeaderboard().catch(() => {})
+      if (document.visibilityState === 'visible') refreshCurrentBets()
     }, POLL_INTERVAL_MS)
+    Promise.resolve().then(refreshCurrentBets)
     return () => clearInterval(timer)
   }, [refreshCurrentBets])
 
@@ -61,7 +45,6 @@ export default function LandingPage() {
     setRefreshing(true)
     try {
       await refreshCurrentBets()
-      await getLeaderboard().catch(() => {})
     } finally {
       setRefreshing(false)
     }
@@ -69,15 +52,6 @@ export default function LandingPage() {
 
   async function handlePlaceBet(bet) {
     const data = await placeBet(bet)
-    setBets((prev) => [
-      ...prev,
-      {
-        id: data.id,
-        name: data.name,
-        spacewalker: data.spacewalker,
-        betAmount: Number(bet.betAmount),
-      },
-    ])
     await refreshCurrentBets()
     return data
   }
@@ -89,7 +63,7 @@ export default function LandingPage() {
       <section className="mt-12 grid grid-cols-1 gap-4 sm:grid-cols-2">
         <StatCard
           label="Total Bets"
-          value={stats.totalBets}
+          value={stats.totalPoints}
           icon="🪙"
           suffix="points"
           accent="gold"
@@ -106,7 +80,7 @@ export default function LandingPage() {
         <div className="overflow-hidden rounded-2xl border border-gold/40 bg-abyss-950/60 backdrop-blur-sm">
           <header className="flex items-center gap-2 border-b border-gold/20 bg-gold/[0.06] px-5 py-4">
             <img src={amongus} alt="" aria-hidden className="h-6 w-6 object-contain" />
-            <h2 className="font-display text-2xl tracking-wide text-gold-light">
+            <h2 className="font-display font-bold text-2xl tracking-wide text-gold-light">
               Place Your Bet
             </h2>
           </header>
@@ -117,9 +91,14 @@ export default function LandingPage() {
 
         <div className="overflow-hidden rounded-2xl border border-ocean/40 bg-abyss-950/60 backdrop-blur-sm">
           <header className="flex items-center gap-2 border-b border-ocean/20 bg-ocean/[0.06] px-5 py-4">
-            <h2 className="font-display text-2xl tracking-wide text-ocean-light">
+            <h2 className="font-display font-bold text-2xl tracking-wide text-ocean-light">
               Current Round Bets
             </h2>
+            {round != null ? (
+              <span className="ml-3 rounded-full border border-ocean/40 bg-ocean/10 px-2.5 py-0.5 text-xs font-semibold text-ocean-light">
+                Round {round}
+              </span>
+            ) : null}
             <button
               type="button"
               onClick={handleRefresh}
@@ -136,6 +115,14 @@ export default function LandingPage() {
             </button>
           </header>
           <div className="p-5">
+            {betsError ? (
+              <div
+                role="alert"
+                className="mb-4 rounded-xl border border-flame/40 bg-flame/10 px-4 py-3 text-sm text-red-300"
+              >
+                ⚠️ {betsError}
+              </div>
+            ) : null}
             <BetsTable bets={bets} loading={loadingBets} />
           </div>
         </div>

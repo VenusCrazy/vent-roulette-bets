@@ -32,8 +32,11 @@ export default {
         },
       },
       fontFamily: {
-        display: ['"Pirata One"', 'cursive'],
-        sans: ['"Inter"', 'system-ui', 'sans-serif'],
+        // display = big text role (logo, headings, stat numbers, CTA labels),
+        // sans = body copy. Same family today, kept separate so the two
+        // roles can diverge later without touching component classNames.
+        display: ['"Poppins"', 'system-ui', 'sans-serif'],
+        sans: ['"Poppins"', 'system-ui', 'sans-serif'],
       },
       boxShadow: {
         'gold-glow': '0 0 28px rgba(245, 158, 11, 0.28)',

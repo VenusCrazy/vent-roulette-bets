@@ -27,7 +27,7 @@ export default function StatCard({ label, value, icon = '', suffix = '', accent 
           <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
             {label}
           </p>
-          <p className="mt-2 font-display text-4xl text-white">
+          <p className="mt-2 font-display font-bold text-4xl text-white">
             {value}
             <span className="ml-1 font-sans text-lg text-slate-400">{suffix}</span>
           </p>
