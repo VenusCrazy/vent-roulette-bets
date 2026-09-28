@@ -28,8 +28,9 @@ export default function BetForm({ onPlaceBet, onGetScore }) {
   const showProblem = status === 'error'
   const showSuccess = status === 'success'
 
-  // The script refuses a bet larger than the team's points, so the form reads
-  // that balance for the entered code and applies the same ceiling up front.
+  // The script refuses a bet larger than the team's available points, so the
+  // form reads that balance for the entered code and applies the same ceiling
+  // up front. It already excludes any stake this team is holding on this round.
   const maxPoints = team?.totalScore >= 0 ? team.totalScore : undefined
 
   function selectVent(value) {
@@ -157,8 +158,9 @@ export default function BetForm({ onPlaceBet, onGetScore }) {
               <span className="font-semibold text-white">{team.totalScore}</span>
             </p>
             <p className="mt-1 text-xs text-slate-400">
-              Your bet cannot exceed {team.totalScore}. Stakes are taken from your points straight
-              away and returned doubled if your vent wins.
+              Your bet cannot exceed {team.totalScore}. Those points are held for the round and
+              come straight back if you refresh it. If your vent wins you are paid twice the
+              stake; if it loses, the stake is gone.
             </p>
           </div>
         ) : null}

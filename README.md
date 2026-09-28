@@ -57,48 +57,68 @@ Two workbooks are involved, and they are not the same one.
 
 | | Role |
 | --- | --- |
-| **The main spreadsheet** (`CONFIG.SCORE_SPREADSHEET_ID`) | Owns the teams and the points. `Sheet1`, row 1 headers, teams from row 2: **A `Team Code` · B `Team Name` · C `Score`**, with the activity columns to the right. This is the only spreadsheet the script reads *or* writes. |
+| **The main spreadsheet** (`CONFIG.SCORE_SPREADSHEET_ID`) | Owns the teams and the points. `Sheet1`, row 1 headers, teams from row 2: **A `Team Code` · B `Team Name` · C `Score`**, with the activity columns to the right. **Read-only** — see below. |
 | **The bound workbook** | Whatever the Apps Script project was created from. The script uses it for nothing except the `Vault Roulette` menu. The old `Betting Sheet` tab there is now unused. |
 
 The script is reached by ID, not through `getActive()`, so the roster comes from the right
 file regardless of which spreadsheet the project is bound to. Change
 `CONFIG.SCORE_SPREADSHEET_ID` if your teams live somewhere else.
 
+### The main spreadsheet is never written
+
+Column C is not a number — it is a formula owned by the other script on that workbook:
+
+```
+=IF(COUNTA(D5:W5)=0, "", SUM(D5:W5))
+```
+
+So this script **only ever reads it**. It never calls `setValue` on that workbook, never
+touches the formula, and a test asserts that a full run of bets, declarations and refreshes
+leaves the sheet byte-for-byte identical. The website is where points move; the sheet's own
+total stays as its own script left it.
+
+The consequence, worth knowing: **your in-sheet `Score` column will not reflect a team's
+betting position during a round.** Someone opening the spreadsheet mid-round sees the
+un-bet total. The site's balance is the honest one.
+
 ### Where the round is kept
 
 **In script properties, not in a spreadsheet.** There is no `Bets` sheet, no `Archive_Bets`
 and no `Config` sheet any more:
 
-- `bets_v1` — `{ r: <round number>, b: [ { c, n, a, v } ] }`, the live round.
+- `bets_v1` — `{ r: <round>, p: { <teamCode>: <settled, ever> }, b: [ { c, n, a, v } ] }`:
+  the round counter, what each team has settled, and the live round.
 - `history_v1` — finished rounds, trimmed to fit the 9KB limit PropertiesService puts on a
   single value, oldest dropped first.
 
-Both are only ever touched under the script lock, so a second bet cannot slip in between the
-debit and the write.
+Both are only ever touched under the script lock.
 
 ### How points move
 
-The stake is **debited from the score column when the bet is placed**, and the payout is
-**credited when the round is declared**:
+Since the sheet is read-only, spendable points are worked out here:
 
-- Bet 200 with 1000 points → the team is on 800 and the bet is recorded.
-- That vent wins → the team is credited 400, landing on 1200. Net **+200**: the stake doubled.
-- That vent loses → nothing is credited, the team stays on 800.
+```
+available = Score as the sheet evaluates it
+         + what this script has settled for that team so far
+         - stakes still in flight this round
+```
 
-`CONFIG.REFUND_NEUTRAL` is `false`, so a vent that neither won nor lost is paid nothing
-either. Of the nine vents that leaves **1 paid and 8 losing**: the winning vent, the two you
-declared as losers, and the six that did nothing at all. `src/lib/settlement.js` mirrors that,
-and a drift guard in the test suite fails if the two ever disagree.
+A stake is **held in the round**, not taken out of the sheet, so a team's points dip while
+the round is open and the sheet never moves. Declaring makes each hold permanent:
 
-Because the debit happens up front, a team's points **dip while a round is open** and rise
-again when you declare. That is deliberate, and it is what your original main-sheet script
-did.
+- Bet 200 with the sheet at 1000 → the team can spend **800**, sheet still says 1000.
+- That vent **wins** → settled **+400**, so it can spend **1400**. Net **+200**: the stake doubled.
+- That vent **loses** → settled **−200**, so it can spend **800**. The stake is gone.
+- **Refresh** instead of declaring → the hold is dropped and the 200 comes straight back. A
+  refresh settles nothing, so it is always safe.
 
-> **Before the first bet: run `inspectScores()` from the editor and read the log.** It prints
-> the resolved columns and, for the first few teams, whether the score cell holds a plain
-> number or a formula. If column C is `=SUM(D2:W2)` or similar, the script **refuses to
-> write** rather than destroy the formula, and bets will fail with *"the score column holds
-> a formula"*. Nothing can be written until that is resolved.
+`CONFIG.REFUND_NEUTRAL` is `false`, so a vent that neither won nor lost forfeits its stake
+too. Of the nine vents that leaves **1 paid and 8 forfeiting**: the winning vent, the two you
+declared as losers, and the six that did nothing at all. `src/lib/settlement.js` mirrors
+that, and a drift guard in the test suite fails if the two ever disagree.
+
+> Because each bet mints or burns points rather than conserving them, this is a game of
+> chance, not a pot. Points can leave the table over a long run.
 
 ### Reading the team data
 
@@ -113,24 +133,27 @@ If the header row is renamed or removed it falls back to `CONFIG.SCORE_NAME` (2)
 if the headings sit further right than column 200.
 
 - **To see everything the script can see**, run `inspectScores()` and open
-  **View → Execution log**.
+  **View → Execution log**. It prints the spreadsheet, the columns it resolved, each team's
+  sheet score next to what it can actually spend, and what this script has settled.
 - **To fetch the roster as JSON**, hit the endpoint in a browser: `…/exec?action=getTeams`,
-  or add `&q=alpha` to search by name or code. `?action=getScore&teamCode=1092` reads one team.
+  or add `&q=alpha` to search by name or code. `?action=getScore&teamCode=1005` reads one
+  team and returns `totalScore` (spendable), `sheetScore` and `inFlight`.
 - **"Sheet not found"** means `CONFIG.SCORE_SHEET` does not match a tab in the main
   spreadsheet. Spaces and capitalisation don't matter (`Sheet 1` and `sheet1` both match
   `Sheet1`), but a differently named tab does not — and the error lists the tabs that do exist.
 
 ### Refreshing a round
 
-Two ways to archive the current round and start the next one. Nothing is settled and **no
-points move** — `declareResult` does that:
+Two ways to archive the current round and start the next one. **Nothing is settled and no
+points move — every held stake is handed straight back:**
 
 - **In the spreadsheet:** the **Vault Roulette → Refresh round (archive & clear)** menu, which
   appears next to Help once the sheet has been opened (the `onOpen` trigger adds it).
 - **From the website:** the **Refresh Round** card on `/admin` (click twice to confirm).
 
 If the stored round ever gets into a bad state, run `clearStoredRounds()` from the editor. It
-throws the round and the archive away and does not touch points.
+throws the round, the archive **and the settled totals** away, which resets every team to
+their sheet score. It never touches the spreadsheet.
 
 There is no access control on the web actions: anyone with the deployed URL (or the `/admin`
 route) can declare results, refresh a round, or read the roster and everyone's bet. Keep the

@@ -13,13 +13,24 @@
  * The roster is read once per execution into an array, and every lookup is an
  * exact compare against that array.
  *
- * Points: a stake is DEBITED from the score column when the bet is placed, and
- * the payout is CREDITED when the round is declared. The winner takes the
- * multiplier; every other vent — the two declared losers and the six that
- * neither won nor lost — is paid nothing, because REFUND_NEUTRAL is false.
- * Because of that, addScore_ refuses to write to a score cell that holds a
- * formula: overwriting =SUM(...) with a plain number would destroy the
- * leaderboard. Run inspectScores() from the editor to see which case you are in.
+ * Points: THE SPREADSHEET IS NEVER WRITTEN. Its Score column is a formula
+ * (=IF(COUNTA(D5:W5)=0,"",SUM(D5:W5))) owned by another script, and this one
+ * only ever reads it. A team's spendable points are therefore computed here:
+ *
+ *   available = Score as the sheet evaluates it
+ *            + what this script has settled for that team so far (state.p)
+ *            - stakes that are still in flight this round
+ *
+ * A stake is HELD in the round rather than taken out of the sheet, so the
+ * sheet's total is never disturbed. When the round is declared the hold is made
+ * permanent: a winner is paid twice their stake, a loser forfeits theirs. That
+ * is the whole of the bet — a winner's net is +stake, a loser's is −stake — and
+ * it is why a game of fixed-multiplier bets mints and burns points rather than
+ * conserving them.
+ *
+ * A refresh settles nothing, so it simply drops the round and hands every
+ * un-settled stake straight back. The site's balance is the honest one; the
+ * sheet's Score column stays exactly as its own script left it.
  */
 const CONFIG = {
   // The spreadsheet that owns the teams and the points.
@@ -85,21 +96,49 @@ function handleBettingAction_(p) {
 
 /* ---------- the stored round ---------- */
 
-// Shape: { r: <round number>, b: [ { c: code, n: name, a: amount, v: vent } ] }
+// Shape: { r: <round>, p: { <teamCode>: <settled adjustment, ever> }, b: [ { c, n, a, v } ] }
 function readRound_() {
   const raw = PropertiesService.getScriptProperties().getProperty(CONFIG.PROPS_BETS);
-  if (!raw) return { r: 1, b: [] };
+  if (!raw) return { r: 1, p: {}, b: [] };
   try {
     const parsed = JSON.parse(raw);
     return {
       r: Number(parsed.r) > 0 ? Number(parsed.r) : 1,
+      // A single number here would mean one team's winnings banked for every
+      // team, so anything that is not a per-team map is discarded rather than
+      // silently shared out.
+      p: parsed.p && typeof parsed.p === 'object' && !Array.isArray(parsed.p) ? parsed.p : {},
       b: Array.isArray(parsed.b) ? parsed.b : [],
     };
   } catch (err) {
     // A corrupt blob must not take the site down; start a fresh round and say so.
     Logger.log('Could not read the stored round (' + err.message + '). Starting round 1 again.');
-    return { r: 1, b: [] };
+    return { r: 1, p: {}, b: [] };
   }
+}
+
+/** What this script has settled in a team's favour, or against them. */
+function settledFor_(state, teamCode) {
+  return Number(state.p[String(teamCode)]) || 0;
+}
+
+/** The stake this team currently has riding on the live round, or 0. */
+function inFlight_(state, teamCode) {
+  const target = String(teamCode);
+  for (let i = 0; i < state.b.length; i++) {
+    if (String(state.b[i].c) === target) return Number(state.b[i].a) || 0;
+  }
+  return 0;
+}
+
+/**
+ * What a team can actually spend right now: the sheet's own Score, plus every
+ * stake this script has settled in their favour or against them, minus whatever
+ * of their own stake is still riding on the open round. This is the only place
+ * points are ever worked out — the spreadsheet is read, never written.
+ */
+function availableFor_(team, state) {
+  return team.totalScore + settledFor_(state, team.teamCode) - inFlight_(state, team.teamCode);
 }
 
 function writeRound_(state) {
@@ -254,29 +293,13 @@ function findTeam_(teamCode) {
   return null;
 }
 
-/** Points are written here, and only here. Returns the team's new score. */
-function addScore_(row, delta) {
-  const cell = scoreSheet_().getRange(row, scoreColumnMap_().total);
-  if (cell.getFormula()) {
-    throw new Error(
-      'The ' + CONFIG.SCORE_SHEET + ' score column holds a formula, so it cannot be ' +
-      'adjusted directly without breaking the total. Run inspectScores() from the ' +
-      'editor and read the log.'
-    );
-  }
-  const after = Math.max(0, (Number(cell.getValue()) || 0) + delta);
-  cell.setValue(after);
-  return after;
-}
-
 /**
- * addScore_ plus the matching update to the cached roster entry, so a round
- * costs one read of the sheet rather than one read per team.
+ * Deliberately no write path exists. The Score column belongs to the other
+ * script that owns this spreadsheet, so this script computes spendable points
+ * for itself and leaves every cell alone. If you ever need to point this at a
+ * sheet you are allowed to write to, that is a deliberate decision to revisit,
+ * not something to bolt on here.
  */
-function creditTeam_(team, delta) {
-  team.totalScore = addScore_(team.row, delta);
-  return team.totalScore;
-}
 
 /* ---------- actions ---------- */
 
@@ -298,10 +321,12 @@ function getBets_() {
 }
 
 function getTeams_(p) {
+  const state = readRound_();
   const teams = roster_().map((t) => ({
     teamCode: t.teamCode,
     teamName: t.teamName,
-    totalScore: t.totalScore,
+    totalScore: availableFor_(t, state),
+    sheetScore: t.totalScore,
   }));
 
   // Optional ?q= search, so a team can be found by name or code.
@@ -321,12 +346,16 @@ function getScore_(p) {
 
   const team = findTeam_(teamCode);
   if (!team) throw new Error('Unknown team ID');
+  const state = readRound_();
 
   return {
     ok: true,
     teamCode: team.teamCode,
     teamName: team.teamName,
-    totalScore: team.totalScore,
+    // What the team can spend, which is what the form needs for its ceiling.
+    totalScore: availableFor_(team, state),
+    sheetScore: team.totalScore,
+    inFlight: inFlight_(state, team.teamCode),
   };
 }
 
@@ -358,19 +387,20 @@ function placeBet_(p) {
       }
     }
 
-    // 3. The stake cannot be more than the team has
-    const total = team.totalScore;
-    if (amount > total) {
-      throw new Error('Bet exceeds your total score (' + total + ')');
+    // 3. The stake cannot be more than the team can spend — the sheet's own
+    //    score, plus settled payouts, minus anything already riding this round.
+    const available = availableFor_(team, state);
+    if (amount > available) {
+      throw new Error('Bet exceeds your total score (' + available + ')');
     }
 
-    // 4. Debit the stake, then record the bet. Both under the same lock, so a
-    //    second bet cannot slip in between them.
-    creditTeam_(team, -amount);
+    // 4. Record the bet. The stake is held in the round, not taken out of the
+    //    spreadsheet, so this team's spendable points drop by `amount` from the
+    //    moment the bet lands. Both halves of that happen under one lock.
     state.b.push({ c: team.teamCode, n: team.teamName, a: amount, v: vent });
     writeRound_(state);
 
-    return { ok: true, totalScore: total, pointsAfterBet: team.totalScore };
+    return { ok: true, totalScore: team.totalScore, pointsAfterBet: available - amount };
   } finally {
     lock.releaseLock();
   }
@@ -395,19 +425,25 @@ function declareResult_(p) {
     const state = readRound_();
     if (!state.b.length) return { ok: true, settled: 0, winningVent: win };
 
-    // The stake was already debited, so this credits the payout only. With
-    // REFUND_NEUTRAL off, a vent that neither won nor lost is paid nothing.
+    // Settling makes each held stake permanent, in opposite directions: a
+    // winner is paid twice their stake, a loser forfeits theirs. Net, a winner
+    // is up by their stake and a loser is down by theirs. With REFUND_NEUTRAL
+    // off, a vent that neither won nor lost forfeits too — one vent pays out,
+    // eight lose their stake.
+    let paidOut = 0;
+    const settledFor = Object.assign({}, state.p);
     const settled = state.b.map((b) => {
+      const stake = Number(b.a) || 0;
       const won = Number(b.v) === win;
-      const payout = won ? Number(b.a) * CONFIG.WIN_MULTIPLIER : 0;
-      if (won) {
-        const team = findTeam_(b.c);
-        if (team) creditTeam_(team, payout);
-      }
+      const payout = won ? stake * CONFIG.WIN_MULTIPLIER : 0;
+      paidOut += payout;
+      // Credited against this team alone. A winner is paid twice their stake;
+      // a loser forfeits the stake that was being held for them.
+      settledFor[b.c] = settledFor_(state, b.c) + (won ? payout : -stake);
       return {
         c: b.c,
         n: b.n,
-        a: Number(b.a),
+        a: stake,
         v: Number(b.v),
         outcome: won ? 'won' : 'lost',
         payout: payout,
@@ -420,17 +456,21 @@ function declareResult_(p) {
       losingVents: [l1, l2],
       settled: settled,
     });
-    writeRound_({ r: state.r + 1, b: [] });
+    writeRound_({ r: state.r + 1, p: settledFor, b: [] });
 
-    return { ok: true, settled: settled.length, winningVent: win };
+    return { ok: true, settled: settled.length, winningVent: win, paidOut: paidOut };
   } finally {
     lock.releaseLock();
   }
 }
 
 /**
- * Refresh: archive the round and start the next one. Nothing is settled and no
- * points move — declareResult does that.
+ * Refresh: archive the round and start the next one. Nothing is settled — only
+ * declareResult pays out.
+ *
+ * Because a stake is held in the round rather than taken out of the spreadsheet,
+ * discarding the round hands every un-settled stake straight back. Nothing is
+ * lost and nothing is paid, so a refresh is always safe to run.
  */
 function resetRound_() {
   const lock = LockService.getScriptLock();
@@ -440,8 +480,8 @@ function resetRound_() {
     if (!state.b.length) return { ok: true, archived: 0 };
 
     const archived = archiveRound_(state, { outcome: 'refreshed' });
-    writeRound_({ r: state.r + 1, b: [] });
-    return { ok: true, archived: archived };
+    writeRound_({ r: state.r + 1, p: state.p, b: [] });
+    return { ok: true, archived: archived, returned: archived };
   } finally {
     lock.releaseLock();
   }
@@ -499,26 +539,29 @@ function onOpen() {
 function refreshFromMenu() {
   const result = resetRound_();
   const message = result.archived
-    ? 'Archived ' + result.archived + ' bet(s) and started the next round. Points are untouched.'
+    ? 'Archived ' + result.archived + ' bet(s), started the next round and returned ' +
+      result.returned + ' held stake(s). Nothing was settled.'
     : 'Nothing to archive — no bets are live.';
   SpreadsheetApp.getUi().alert(message);
 }
 
 /**
  * Run this from the editor and read View > Logs. It prints the spreadsheet the
- * roster is read from, the columns it resolved, the first few teams, and —
- * the important one — whether the score column holds a plain number or a
- * formula. A formula means addScore_ will refuse to write, because a stake
- * cannot be debited from a cell that is already =SUM(something).
+ * roster is read from, the columns it resolved, the first few teams with what
+ * the Score cell actually holds, and how the script's own balance compares to
+ * the sheet's. This script never writes to the spreadsheet, so a formula in
+ * that column is fine — it is simply read as the value it evaluates to.
  */
 function inspectScores() {
   const ss = scoreSpreadsheet_();
   const sheet = scoreSheet_();
   const cols = scoreColumnMap_();
+  const state = readRound_();
 
   Logger.log('Spreadsheet: ' + ss.getName());
   Logger.log('URL: ' + ss.getUrl());
   Logger.log('Tab: "' + sheet.getName() + '"  —  ' + sheet.getLastRow() + ' row(s) x ' + sheet.getLastColumn() + ' col(s)');
+  Logger.log('Read-only: this script never writes to this spreadsheet.');
   Logger.log(
     'In use — name: column ' + cols.name + ' (' + columnLetter_(cols.name) +
     '), team code: column ' + cols.code + ' (' + columnLetter_(cols.code) +
@@ -528,17 +571,30 @@ function inspectScores() {
 
   const teams = roster_();
   Logger.log('Usable teams: ' + teams.length);
-  teams.slice(0, 5).forEach((t) => {
+  teams.slice(0, 8).forEach((t) => {
     const cell = sheet.getRange(t.row, cols.total);
+    const riding = inFlight_(state, t.teamCode);
     Logger.log(
       '  row ' + t.row + ': code="' + t.teamCode + '" name="' + t.teamName +
-      '" score=' + t.totalScore + '  formula=' +
-      (cell.getFormula() || '(none — a plain number, so stakes can be debited from it)')
+      '" sheet=' + t.totalScore + '  available=' + availableFor_(t, state) +
+      (riding ? '  (stake of ' + riding + ' riding this round)' : '') +
+      '  formula=' + (cell.getFormula() || '(a plain number)')
     );
   });
 
-  const state = readRound_();
   Logger.log('Round ' + state.r + ' — ' + state.b.length + ' live bet(s) in script properties');
+  const settledCodes = Object.keys(state.p);
+  Logger.log(
+    settledCodes.length
+      ? 'Settled by this script so far: ' +
+          settledCodes.map((c) => c + ' ' + (state.p[c] > 0 ? '+' : '') + state.p[c]).join(', ')
+      : 'Settled by this script so far: nothing yet.'
+  );
+  Logger.log(
+    state.b.length
+      ? 'A team\'s available points already exclude its own stake this round.'
+      : 'No stakes are in flight, so every available figure equals the sheet plus what is settled.'
+  );
 }
 
 /**

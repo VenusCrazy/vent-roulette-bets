@@ -155,7 +155,7 @@ export default function AdminPage() {
       const data = await resetRound()
       setRefreshMessage(
         data.archived
-          ? `Archived ${data.archived} bet(s) and started the next round. Points are untouched.`
+          ? `Archived ${data.archived} bet(s), started the next round and returned ${data.returned ?? data.archived} held stake(s). Nothing was settled.`
           : 'Nothing to archive — no bets are live.'
       )
       setRefreshArmed(false)
@@ -177,7 +177,7 @@ export default function AdminPage() {
         </h1>
         <p className="mt-3 text-slate-400">
           Name the vent that carried the day and the two that lost. The winner&apos;s bets are
-          credited twice their stake, and everyone else keeps nothing.
+          paid twice their stake; every other bet loses its stake.
         </p>
         <div
           aria-hidden
@@ -210,9 +210,9 @@ export default function AdminPage() {
             Refresh Round
           </h2>
           <p className="mt-1 text-xs text-slate-400">
-            Archives the live round and starts the next one. Nothing is settled and no points
-            move — declaring a result does that. Stakes already taken stay deducted until the
-            round is declared.
+            Archives the live round, starts the next one and hands every held stake straight back.
+            Nothing is settled and no points move — declaring a result does that, so a refresh is
+            always safe to run.
           </p>
         </header>
         <div className="flex flex-col gap-4 p-5">

@@ -86,8 +86,8 @@ class FakeSpreadsheet {
 }
 
 // The main spreadsheet, reached by ID: row 1 headers, teams from row 2,
-// A Team Code, B Team Name, C Score. A few activity columns follow, like the
-// real sheet, but nothing reads them.
+// A Team Code, B Team Name, C Score. C holds a SUM(D:W)-style formula owned by
+// another script, exactly like the real sheet — this mock only ever reads it.
 const scoreSheet = new FakeSheet('Sheet1', [
   ['Team Code', 'Team Name', 'Score'],
   ['1092', 'Alpha', 1000, 120, 80, 90],
@@ -96,6 +96,10 @@ const scoreSheet = new FakeSheet('Sheet1', [
   ['3232', 'Delta', 1000, 160, 70, 55],
   ['4141', 'Echo', 1000, 110, 90, 95],
 ])
+scoreSheet.data.slice(1).forEach((_, i) => {
+  const row = i + 2
+  scoreSheet.formulas.set(`${row},3`, `=IF(COUNTA(D${row}:W${row})=0, "", SUM(D${row}:W${row}))`)
+})
 const scoreBook = new FakeSpreadsheet('Main Spreadsheet', [scoreSheet])
 
 // The workbook the script is bound to. Deliberately has no team data.

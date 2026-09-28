@@ -207,14 +207,13 @@ export default function AdminDeclareWinner({
 
             {preview.won > 0 ? (
               <p className="mt-3 text-xs text-slate-400">
-                {preview.won} bet(s) on vent {ventName(winner)} are credited twice their stake.
-                Everyone else keeps nothing.
+                {preview.won} bet(s) on vent {ventName(winner)} are paid twice their stake.
               </p>
             ) : null}
             {preview.lost > 0 ? (
               <p className="mt-1 text-xs text-slate-400">
-                {preview.lost} bet(s) are paid nothing. The two declared losers lose their stake, and
-                so does a vent that neither won nor lost — there are no refunds this round.
+                {preview.lost} bet(s) lose their stake: the two declared losers, and any vent that
+                neither won nor lost. There are no refunds this round.
               </p>
             ) : null}
           </div>
@@ -238,7 +237,7 @@ export default function AdminDeclareWinner({
             {resolution && resolution.rows.length > 0 ? (
               <div className="mt-3 border-t border-green-500/20 pt-2">
                 <p className="mb-2 text-xs font-semibold text-green-200">
-                  Credited to the score column ({resolution.rows.length} team(s)):
+                  Settled against these balances ({resolution.rows.length} team(s)):
                 </p>
                 <div className="overflow-x-auto">
                   <table className="w-full text-left text-xs text-green-100">
@@ -284,9 +283,9 @@ export default function AdminDeclareWinner({
               Winning Vent {winner}, losing Vents {loser1} and {loser2}. Confirm?
             </p>
             <p className="mt-2 text-xs text-slate-400">
-              This credits every bet on Vent {winner} with twice its stake, pays nothing to the
-              rest, archives the round and advances it. The stakes were already taken when the
-              bets were placed, so it only adds to the balances now — it cannot be undone.
+              This pays every bet on Vent {winner} twice its stake, forfeits the stake on every
+              other vent, archives the round and advances it. The held stakes become permanent —
+              it cannot be undone.
             </p>
 
             <div className="mt-4 flex flex-col gap-3 sm:flex-row">

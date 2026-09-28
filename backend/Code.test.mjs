@@ -16,11 +16,12 @@ import { computeSettlement } from '../src/lib/settlement.js'
 const here = dirname(fileURLToPath(import.meta.url))
 const source = readFileSync(join(here, 'Code.gs'), 'utf8')
 
-// The real Sheet1 layout: A Team Code, B Team Name, C Score.
+// The real Sheet1 layout: A Team Code, B Team Name, C Score, teams from row 2.
 const SCORE_CODE = 1
 const SCORE_NAME = 2
 const SCORE_TOTAL = 3
 const SCORE_COLS = 3
+const SCORE_FIRST_ROW = 2
 const SCORE_HEADER = ['Team Code', 'Team Name', 'Score']
 
 // ---------- fake Sheets API ----------
@@ -59,6 +60,7 @@ class FakeRange {
     return this.sheet.formulas.get(this._key(this.row, this.col)) || ''
   }
   setValue(v) {
+    this.sheet.writes.push(this._key(this.row, this.col))
     this.sheet.formulas.delete(this._key(this.row, this.col))
     this._write(this.row, this.col, v)
     return this
@@ -66,6 +68,7 @@ class FakeRange {
   setValues(values) {
     values.forEach((row, ri) =>
       row.forEach((v, ci) => {
+        this.sheet.writes.push(this._key(this.row + ri, this.col + ci))
         this.sheet.formulas.delete(this._key(this.row + ri, this.col + ci))
         this._write(this.row + ri, this.col + ci, v)
       })
@@ -86,6 +89,8 @@ class FakeSheet {
     this.data = data
     this.sheetId = sheetId
     this.formulas = new Map()
+    // Every cell this fake was written to. The main spreadsheet must stay empty.
+    this.writes = []
   }
   getName() {
     return this.name
@@ -180,7 +185,16 @@ function setup({
   liveBets = [],
   boundSheets = [['Betting Sheet', [['Team Name', 'TeamCode']]]],
 } = {}) {
+  // Mirrors the real sheet: the score cells hold SUM(D:W)-style formulas owned
+  // by another script, so nothing here may write to them.
   const scoreSheet = new FakeSheet(scoreName, [scoreHeader.slice(), ...scoreTeams], 1)
+  scoreTeams.forEach((_, i) => {
+    const row = SCORE_FIRST_ROW + i
+    scoreSheet.formulas.set(
+      `${row},${SCORE_TOTAL}`,
+      `=IF(COUNTA(D${row}:W${row})=0, "", SUM(D${row}:W${row}))`
+    )
+  })
   for (const [key, formula] of Object.entries(scoreFormulas)) scoreSheet.formulas.set(key, formula)
   const scoreBook = new FakeSpreadsheet('Main Spreadsheet', [
     scoreSheet,
@@ -254,7 +268,22 @@ function setup({
     return raw ? JSON.parse(raw) : null
   }
 
-  return { backend, scoreSheet, scoreBook, boundBook, props, logs, logged, history, storedRound, opened, maxLockDepth }
+  return {
+    backend,
+    scoreSheet,
+    scoreBook,
+    boundBook,
+    props,
+    logs,
+    logged,
+    history,
+    storedRound,
+    opened,
+    maxLockDepth,
+    /** Nothing may ever land here: the spreadsheet is read-only. */
+    sheetWrites: () => scoreSheet.writes,
+    available: (code) => backend.getScore_({ teamCode: code }).totalScore,
+  }
 }
 
 // ---------- contract ----------
@@ -296,7 +325,7 @@ test('the roster is read from the other spreadsheet, never the bound workbook', 
   })
 
   assert.deepEqual(backend.getTeams_({}).teams, [
-    { teamCode: '1092', teamName: 'Alpha', totalScore: 500 },
+    { teamCode: '1092', teamName: 'Alpha', totalScore: 500, sheetScore: 500 },
   ])
   assert.deepEqual(opened, ['165jVE7EteZQb4w4RoiHzXMHAVf4Akgt0xdSSzBi2lQM'], 'opened by ID')
   assert.ok(!boundBook.byName.get('Sheet1').data.some((r) => r.includes('1092')), 'the decoy was ignored')
@@ -351,8 +380,8 @@ test('getTeams returns the whole roster in sheet order', () => {
   assert.deepEqual(backend.getTeams_({}), {
     ok: true,
     teams: [
-      { teamCode: '1092', teamName: 'Alpha Squad', totalScore: 500 },
-      { teamCode: '2424', teamName: 'Bravo', totalScore: 0 },
+      { teamCode: '1092', teamName: 'Alpha Squad', totalScore: 500, sheetScore: 500 },
+      { teamCode: '2424', teamName: 'Bravo', totalScore: 0, sheetScore: 0 },
     ],
   })
 })
@@ -385,24 +414,37 @@ test('a team is matched only by the team-code column, not by any cell in the row
       scoreTeam('Bravo', '2324', '1092'),
     ],
   })
+  // '1092' is the code of Alpha, but it is also the NAME of Bravo and the raw
+  // score value of Charlie. Only the code column may match it.
   assert.equal(backend.getScore_({ teamCode: '1092' }).teamName, 'Alpha')
+  assert.equal(backend.getScore_({ teamCode: '1092' }).sheetScore, 500)
+  assert.equal(backend.getScore_({ teamCode: '2324' }).teamName, 'Bravo')
+  assert.equal(backend.getScore_({ teamCode: '2324' }).sheetScore, 1092, 'the number in its score cell')
+
   backend.placeBet_({ teamCode: '1092', amount: 100, vent: 1 })
-  assert.equal(cell(scoreSheet, 2, SCORE_TOTAL), 400, 'Alpha was debited')
-  assert.equal(cell(scoreSheet, 3, SCORE_TOTAL), 400, 'the row whose name is the code was not')
-  assert.equal(cell(scoreSheet, 4, SCORE_TOTAL), '1092', 'the row whose score is the code was not')
+  assert.deepEqual(
+    backend.getTeams_({}).teams.map((t) => [t.teamCode, t.totalScore]),
+    [['1092', 400], ['2424', 400], ['2324', 1092]],
+    'only the team that bet has less to spend'
+  )
+  assert.deepEqual(scoreSheet.writes, [], 'and the spreadsheet was never touched')
 })
 
-test('getScore reads the team name and total score, and never writes', () => {
-  const { backend, scoreSheet } = setup({ scoreTeams: [scoreTeam('Alpha Squad', '1092', 500)] })
+test('getScore reports the spendable balance, the sheet value behind it, and the stake in flight', () => {
+  const { backend, scoreSheet } = setup({
+    scoreTeams: [scoreTeam('Alpha Squad', '1092', 500)],
+    liveBets: [['1092', 200, 3]],
+  })
   assert.deepEqual(backend.getScore_({ teamCode: ' 1092 ' }), {
     ok: true,
     teamCode: '1092',
     teamName: 'Alpha Squad',
-    totalScore: 500,
+    totalScore: 300, // 500 from the sheet, less the 200 already riding
+    sheetScore: 500,
+    inFlight: 200,
   })
-  const before = JSON.stringify(scoreSheet.data)
-  backend.getScore_({ teamCode: '1092' })
-  assert.equal(JSON.stringify(scoreSheet.data), before)
+  assert.equal(cell(scoreSheet, 2, SCORE_TOTAL), 500, 'the sheet still says 500')
+  assert.deepEqual(scoreSheet.writes, [], 'reading it wrote nothing')
 })
 
 test('getScore rejects an unknown team and a missing team code', () => {
@@ -433,10 +475,11 @@ test('the team data is read from whichever columns the header row names', () => 
   })
 
   assert.deepEqual(backend.getTeams_({}).teams, [
-    { teamCode: '1092', teamName: 'Alpha Squad', totalScore: 500 },
+    { teamCode: '1092', teamName: 'Alpha Squad', totalScore: 500, sheetScore: 500 },
   ])
   backend.placeBet_({ teamCode: '1092', amount: 200, vent: 1 })
-  assert.equal(cell(scoreSheet, 2, 8), 300, 'the detected score column was debited')
+  assert.equal(cell(scoreSheet, 2, 8), 500, 'the detected score column is read, not written')
+  assert.equal(backend.getScore_({ teamCode: '1092' }).totalScore, 300, 'the stake is held in the round')
   assert.ok(logged(/team code D \(4\), total score H \(8\)/), 'the resolution is logged')
 })
 
@@ -444,7 +487,9 @@ test('a spreadsheet with no header row falls back to the CONFIG columns', () => 
   const header = new Array(SCORE_COLS).fill('')
   header[0] = 'Vault Roulette'
   const { backend, logged } = setup({ scoreHeader: header, scoreTeams: [scoreTeam('Alpha', '1092', 500)] })
-  assert.deepEqual(backend.getTeams_({}).teams, [{ teamCode: '1092', teamName: 'Alpha', totalScore: 500 }])
+  assert.deepEqual(backend.getTeams_({}).teams, [
+    { teamCode: '1092', teamName: 'Alpha', totalScore: 500, sheetScore: 500 },
+  ])
   assert.ok(logged(/no matching headers on row 1, using the CONFIG columns/))
 })
 
@@ -459,7 +504,7 @@ test('a tab named differently is still found, ignoring case and spaces', () => {
   for (const name of ['Sheet 1', 'sheet1', 'SHEET1 ']) {
     const { backend } = setup({ scoreName: name, scoreTeams: [scoreTeam('Alpha', '1092', 500)] })
     assert.deepEqual(backend.getTeams_({}).teams, [
-      { teamCode: '1092', teamName: 'Alpha', totalScore: 500 },
+      { teamCode: '1092', teamName: 'Alpha', totalScore: 500, sheetScore: 500 },
     ], `matched a tab called "${name}"`)
   }
 })
@@ -482,24 +527,27 @@ test('a genuinely different tab is an error that names the tabs that do exist', 
 
 // ---------- placeBet ----------
 
-test('a bet debits the score column and records amount, vent and points after', () => {
+test('a bet holds the stake in the round instead of taking it out of the spreadsheet', () => {
   const { backend, scoreSheet, storedRound } = setup({ scoreTeams: [scoreTeam('Alpha Squad', '1092', 500)] })
   assert.deepEqual(backend.placeBet_({ teamCode: '1092', amount: 200, vent: 3 }), {
     ok: true,
     totalScore: 500,
     pointsAfterBet: 300,
   })
-  assert.equal(cell(scoreSheet, 2, SCORE_TOTAL), 300, 'the stake left the team balance')
+  assert.equal(cell(scoreSheet, 2, SCORE_TOTAL), 500, 'the sheet is untouched')
+  assert.deepEqual(scoreSheet.writes, [], 'not one cell was written')
   assert.deepEqual(storedRound(), {
     r: 1,
+    p: {},
     b: [{ c: '1092', n: 'Alpha Squad', a: 200, v: 3 }],
   })
+  assert.equal(backend.getScore_({ teamCode: '1092' }).totalScore, 300, 'but the team has 300 to spend')
 })
 
-test('a bet equal to the total score is allowed; anything above it is rejected', () => {
-  const { backend, scoreSheet, storedRound } = setup({ scoreTeams: [scoreTeam('Alpha', '1092', 500)] })
+test('a bet equal to the balance is allowed; anything above it is rejected', () => {
+  const { backend, storedRound } = setup({ scoreTeams: [scoreTeam('Alpha', '1092', 500)] })
   assert.equal(backend.placeBet_({ teamCode: '1092', amount: 500, vent: 1 }).pointsAfterBet, 0)
-  assert.equal(cell(scoreSheet, 2, SCORE_TOTAL), 0)
+  assert.equal(backend.getScore_({ teamCode: '1092' }).totalScore, 0)
   assert.equal(storedRound().b.length, 1)
 
   const second = setup({ scoreTeams: [scoreTeam('Alpha', '1092', 500)] })
@@ -507,12 +555,23 @@ test('a bet equal to the total score is allowed; anything above it is rejected',
     () => second.backend.placeBet_({ teamCode: '1092', amount: 501, vent: 1 }),
     /Bet exceeds your total score \(500\)/
   )
-  assert.equal(cell(second.scoreSheet, 2, SCORE_TOTAL), 500, 'a rejected bet moves no points')
-  assert.equal(second.storedRound(), null, 'and is not recorded')
+  assert.equal(second.storedRound(), null, 'a rejected bet is not recorded')
+  assert.equal(second.available('1092'), 500, 'and moves no points')
 })
 
-test('a second bet in the same round is rejected and does not debit again', () => {
-  const { backend, scoreSheet, storedRound } = setup({
+test('a banked payout raises what a team can spend, and the sheet never sees it', () => {
+  const { backend, scoreSheet, available } = setup({ scoreTeams: [scoreTeam('Alpha', '1092', 500)] })
+  backend.placeBet_({ teamCode: '1092', amount: 200, vent: 1 })
+  assert.equal(available('1092'), 300, 'the stake is held back while the round is open')
+
+  backend.declareResult_({ winningVent: 1, losingVent1: 2, losingVent2: 3 })
+  assert.equal(available('1092'), 900, '500 from the sheet plus the 400 payout')
+  assert.equal(cell(scoreSheet, 2, SCORE_TOTAL), 500, 'the sheet still says 500')
+  assert.deepEqual(scoreSheet.writes, [])
+})
+
+test('a second bet in the same round is rejected and does not double-hold the stake', () => {
+  const { backend, storedRound } = setup({
     scoreTeams: [scoreTeam('Alpha', '1092', 500)],
     liveBets: [['1092', 200, 1]],
   })
@@ -520,34 +579,59 @@ test('a second bet in the same round is rejected and does not debit again', () =
     () => backend.placeBet_({ teamCode: '1092', amount: 10, vent: 2 }),
     /already placed a bet this round/
   )
-  assert.equal(cell(scoreSheet, 2, SCORE_TOTAL), 300, 'still debited once')
+  assert.equal(backend.getScore_({ teamCode: '1092' }).totalScore, 300, 'still held once')
   assert.equal(storedRound().b.length, 1)
 })
 
 test('placeBet validates amount, vent and team code before touching anything', () => {
-  const { backend, scoreSheet, storedRound } = setup({ scoreTeams: [scoreTeam('Alpha', '1092', 500)] })
+  const { backend, storedRound } = setup({ scoreTeams: [scoreTeam('Alpha', '1092', 500)] })
   assert.throws(() => backend.placeBet_({ teamCode: '1092', amount: 0, vent: 1 }), /positive whole number/)
   assert.throws(() => backend.placeBet_({ teamCode: '1092', amount: 2.5, vent: 1 }), /positive whole number/)
   assert.throws(() => backend.placeBet_({ teamCode: '1092', amount: 10, vent: 0 }), /1 to 9/)
   assert.throws(() => backend.placeBet_({ teamCode: '1092', amount: 10, vent: 10 }), /1 to 9/)
   assert.throws(() => backend.placeBet_({ amount: 10, vent: 1 }), /Team ID is required/)
   assert.throws(() => backend.placeBet_({ teamCode: '9999', amount: 10, vent: 1 }), /Unknown team ID/)
-  assert.equal(cell(scoreSheet, 2, SCORE_TOTAL), 500, 'no points moved')
+  assert.equal(backend.getScore_({ teamCode: '1092' }).totalScore, 500, 'no points moved')
   assert.equal(storedRound(), null, 'nothing recorded')
 })
 
-test('a score cell holding a formula is refused, so the total cannot be destroyed', () => {
-  const { backend, scoreSheet, storedRound } = setup({
-    scoreTeams: [scoreTeam('Alpha', '1092', 500)],
-    // C2 is =SUM(D2:W2), exactly the shape a per-activity game sheet has.
-    scoreFormulas: { '2,3': '=SUM(D2:W2)' },
+test('a score cell holding a formula is read as its value and never overwritten', () => {
+  const { backend, scoreSheet } = setup({ scoreTeams: [scoreTeam('Alpha', '1092', 2090)] })
+  assert.equal(scoreSheet.formulas.get('2,3'), '=IF(COUNTA(D2:W2)=0, "", SUM(D2:W2))')
+  assert.equal(backend.getScore_({ teamCode: '1092' }).totalScore, 2090, 'the formula evaluates to a balance')
+
+  backend.placeBet_({ teamCode: '1092', amount: 200, vent: 1 })
+  backend.declareResult_({ winningVent: 1, losingVent1: 2, losingVent2: 3 })
+  backend.resetRound_()
+
+  assert.equal(scoreSheet.formulas.get('2,3'), '=IF(COUNTA(D2:W2)=0, "", SUM(D2:W2))', 'the formula is intact')
+  assert.deepEqual(scoreSheet.writes, [], 'and no cell was written at any point')
+})
+
+test('a whole round of bets, declarations and refreshes never writes to the spreadsheet', () => {
+  const { backend, scoreSheet } = setup({
+    scoreTeams: [scoreTeam('Alpha', '1092', 1000), scoreTeam('Bravo', '2424', 800)],
   })
-  assert.throws(
-    () => backend.placeBet_({ teamCode: '1092', amount: 200, vent: 1 }),
-    /score column holds a formula/
+  for (let round = 0; round < 5; round++) {
+    const vent = (round % 9) + 1
+    // The two declared losers have to be different from the winning vent.
+    const losing = [((vent + 1) % 9) + 1, ((vent + 2) % 9) + 1]
+    backend.placeBet_({ teamCode: '1092', amount: 100, vent })
+    backend.placeBet_({ teamCode: '2424', amount: 50, vent })
+    backend.getTeams_({})
+    backend.getBets_()
+    if (round % 2 === 0) {
+      backend.declareResult_({ winningVent: vent, losingVent1: losing[0], losingVent2: losing[1] })
+    } else {
+      backend.resetRound_()
+    }
+  }
+  assert.deepEqual(scoreSheet.writes, [], 'Sheet1 is read-only, always')
+  assert.deepEqual(
+    scoreSheet.data,
+    [['Team Code', 'Team Name', 'Score'], ['1092', 'Alpha', 1000], ['2424', 'Bravo', 800]],
+    'and its contents are byte-for-byte what they started as'
   )
-  assert.equal(scoreSheet.formulas.get('2,3'), '=SUM(D2:W2)', 'the formula is intact')
-  assert.equal(storedRound(), null, 'the bet is not recorded either')
 })
 
 test('every write path takes the script lock, and releases it', () => {
@@ -564,18 +648,18 @@ test('every write path takes the script lock, and releases it', () => {
 
 // ---------- declareResult ----------
 
-test('declaring credits the winner, pays nobody else, and starts the next round', () => {
-  const { backend, scoreSheet, history, storedRound } = setup({
+test('declaring pays the winner into the bank, pays nobody else, and starts the next round', () => {
+  const { backend, history, storedRound, available } = setup({
     scoreTeams: [scoreTeam('Alpha', '1092', 500), scoreTeam('Bravo', '2424', 500), scoreTeam('Charlie', '2324', 500)],
     liveBets: [['1092', 200, 1], ['2424', 100, 2], ['2324', 50, 7]],
   })
   const out = backend.declareResult_({ winningVent: 1, losingVent1: 2, losingVent2: 3 })
-  assert.deepEqual(out, { ok: true, settled: 3, winningVent: 1 })
+  assert.deepEqual(out, { ok: true, settled: 3, winningVent: 1, paidOut: 400 })
 
-  // Alpha staked 200: 500 -> 300 on the bet, then +400 for winning it.
-  assert.equal(cell(scoreSheet, 2, SCORE_TOTAL), 700, 'winner is made whole and then 200 up')
-  assert.equal(cell(scoreSheet, 3, SCORE_TOTAL), 400, 'a declared loser keeps nothing')
-  assert.equal(cell(scoreSheet, 4, SCORE_TOTAL), 450, 'a neutral vent loses the stake, not refunded')
+  // Alpha staked 200 and won: 500 from the sheet, plus the 400 payout.
+  assert.equal(available('1092'), 900, 'winner is paid twice the stake')
+  assert.equal(available('2424'), 400, 'a declared loser gets nothing')
+  assert.equal(available('2324'), 450, 'a neutral vent loses its stake, not refunded')
 
   const [round] = history()
   assert.equal(round.round, 1)
@@ -588,8 +672,22 @@ test('declaring credits the winner, pays nobody else, and starts the next round'
     ['2324', 'lost', 0],
   ])
 
-  assert.deepEqual(storedRound(), { r: 2, b: [] }, 'the round advanced and the bets cleared')
+  assert.deepEqual(
+    storedRound(),
+    { r: 2, p: { '1092': 400, '2424': -100, '2324': -50 }, b: [] },
+    'the round advanced and each team was settled on its own line'
+  )
   assert.equal(backend.getBets_().activeBets, 0)
+})
+
+test('one team winnings are never banked for another', () => {
+  const { backend, available } = setup({
+    scoreTeams: [scoreTeam('Alpha', '1092', 500), scoreTeam('Bravo', '2424', 500)],
+    liveBets: [['1092', 200, 1], ['2424', 100, 1]],
+  })
+  backend.declareResult_({ winningVent: 1, losingVent1: 2, losingVent2: 3 })
+  assert.equal(available('1092'), 900, 'winner up by their stake')
+  assert.equal(available('2424'), 700, 'the other winner up by theirs, not both up by 400')
 })
 
 test('the frontend preview predicts exactly what the script credits, across all nine vents', () => {
@@ -602,10 +700,9 @@ test('the frontend preview predicts exactly what the script credits, across all 
     liveBets.push([`code${v}`, 100, v])
   }
 
-  const { backend, scoreSheet, history } = setup({ scoreTeams, liveBets })
-  // setup() has already debited each stake, so this is the post-bet balance.
-  const afterBet = scoreTeams.map((_, i) => cell(scoreSheet, i + 2, SCORE_TOTAL))
-  assert.ok(afterBet.every((v) => v === 900), 'every stake came off first')
+  const { backend, history, available } = setup({ scoreTeams, liveBets })
+  // setup() has already placed the bets, so each stake is held back.
+  for (let v = 1; v <= 9; v++) assert.equal(available(`code${v}`), 900, `vent ${v} stake held`)
 
   assert.equal(backend.declareResult_({ winningVent: win, losingVent1: losers[0], losingVent2: losers[1] }).settled, 9)
 
@@ -615,12 +712,15 @@ test('the frontend preview predicts exactly what the script credits, across all 
     const archived = round.settled[v - 1]
     assert.equal(archived.outcome, predicted.outcome, `vent ${v} outcome`)
     assert.equal(archived.payout, predicted.payout, `vent ${v} payout`)
-    assert.equal(cell(scoreSheet, v + 1, SCORE_TOTAL), afterBet[v - 1] + predicted.payout, `vent ${v} balance`)
+    // The sheet said 1000 throughout. Settling makes the held stake permanent:
+    // a winner is paid 200 and lands on 1200, a loser forfeits 100 and lands on 900.
+    const expected = predicted.outcome === 'won' ? 1000 + predicted.payout : 1000 - 100
+    assert.equal(available(`code${v}`), expected, `vent ${v} balance`)
   }
 })
 
 test('declareResult rejects out-of-range vents and duplicates', () => {
-  const { backend, scoreSheet } = setup({
+  const { backend, available } = setup({
     scoreTeams: [scoreTeam('Alpha', '1092', 500)],
     liveBets: [['1092', 200, 1]],
   })
@@ -628,7 +728,7 @@ test('declareResult rejects out-of-range vents and duplicates', () => {
   assert.throws(() => backend.declareResult_({ winningVent: 0, losingVent1: 2, losingVent2: 3 }), /valid vents/)
   assert.throws(() => backend.declareResult_({ winningVent: 1, losingVent1: 1, losingVent2: 3 }), /all be different/)
   assert.throws(() => backend.declareResult_({ winningVent: 1, losingVent1: 2, losingVent2: 2 }), /all be different/)
-  assert.equal(cell(scoreSheet, 2, SCORE_TOTAL), 300, 'the round is untouched')
+  assert.equal(available('1092'), 300, 'the round is untouched')
 })
 
 test('declaring with no bets settles nothing and writes no archive', () => {
@@ -643,26 +743,44 @@ test('declaring with no bets settles nothing and writes no archive', () => {
 
 // ---------- resetRound ----------
 
-test('resetRound archives the round, advances it and moves no points', () => {
-  const { backend, scoreSheet, history, storedRound } = setup({
+test('a refresh hands back every un-settled stake and banks nothing', () => {
+  const { backend, scoreSheet, history, storedRound, available } = setup({
     scoreTeams: [scoreTeam('Alpha', '1092', 500), scoreTeam('Bravo', '2424', 500)],
     liveBets: [['1092', 200, 1], ['2424', 150, 3]],
   })
+  assert.equal(available('1092'), 300, 'the stakes are held while the round is open')
+
   const out = backend.resetRound_()
-  assert.deepEqual(out, { ok: true, archived: 2 })
+  assert.deepEqual(out, { ok: true, archived: 2, returned: 2 })
 
   const [round] = history()
   assert.equal(round.outcome, 'refreshed', 'a refresh decides nothing')
   assert.equal(round.winningVent, undefined)
   assert.deepEqual(round.bets.map((b) => [b.c, b.a, b.v]), [['1092', 200, 1], ['2424', 150, 3]])
 
-  assert.equal(cell(scoreSheet, 2, SCORE_TOTAL), 300, 'the stake stays debited until a round is declared')
-  assert.equal(cell(scoreSheet, 3, SCORE_TOTAL), 350)
-  assert.deepEqual(storedRound(), { r: 2, b: [] })
+  assert.equal(available('1092'), 500, 'the stake came straight back')
+  assert.equal(available('2424'), 500, 'for everyone')
+  assert.equal(cell(scoreSheet, 2, SCORE_TOTAL), 500)
+  assert.deepEqual(scoreSheet.writes, [])
+  assert.deepEqual(storedRound(), { r: 2, p: {}, b: [] }, 'nothing was banked')
   assert.deepEqual(backend.getBets_().bets, [])
 })
 
-test('a team can bet again straight after a refresh', () => {
+test('a refresh keeps payouts already banked from earlier rounds', () => {
+  const { backend, available } = setup({
+    scoreTeams: [scoreTeam('Alpha', '1092', 500)],
+    liveBets: [['1092', 200, 1]],
+  })
+  backend.declareResult_({ winningVent: 1, losingVent1: 2, losingVent2: 3 })
+  assert.equal(available('1092'), 900)
+
+  backend.placeBet_({ teamCode: '1092', amount: 400, vent: 5 })
+  assert.equal(available('1092'), 500, '400 held out of 900')
+  backend.resetRound_()
+  assert.equal(available('1092'), 900, 'the stake came back; the earlier payout stayed')
+})
+
+test('a team can bet again straight after a refresh, against its full balance', () => {
   const { backend } = setup({
     scoreTeams: [scoreTeam('Alpha', '1092', 500)],
     liveBets: [['1092', 200, 1]],
@@ -670,7 +788,7 @@ test('a team can bet again straight after a refresh', () => {
   backend.resetRound_()
   const out = backend.placeBet_({ teamCode: '1092', amount: 100, vent: 5 })
   assert.equal(out.ok, true)
-  assert.equal(out.pointsAfterBet, 200, 'bets against the post-bet balance')
+  assert.equal(out.pointsAfterBet, 400, 'the returned stake is spendable again')
 })
 
 test('resetRound on a clear round archives nothing and writes no archive', () => {
@@ -686,7 +804,7 @@ test('resetRound on a clear round archives nothing and writes no archive', () =>
 
 test('the resetRound web action archives and clears with no credentials', () => {
   const { backend } = setup({ scoreTeams: [scoreTeam('Alpha', '1092', 500)], liveBets: [['1092', 200, 1]] })
-  assert.deepEqual(backend.handleBettingAction_({ action: 'resetRound' }), { ok: true, archived: 1 })
+  assert.deepEqual(backend.handleBettingAction_({ action: 'resetRound' }), { ok: true, archived: 1, returned: 1 })
   assert.deepEqual(backend.getBets_().bets, [])
 })
 
@@ -725,34 +843,55 @@ test('a corrupt archive is replaced rather than blocking the round', () => {
   assert.ok(logged(/Could not read the archive/))
 })
 
-test('clearStoredRounds throws the round and archive away but leaves points alone', () => {
-  const { backend, scoreSheet, history, storedRound, props } = setup({
+test('clearStoredRounds throws the round, the archive and the banked payouts away', () => {
+  const { backend, scoreSheet, history, storedRound, props, available } = setup({
     scoreTeams: [scoreTeam('Alpha', '1092', 500)],
     liveBets: [['1092', 200, 1]],
   })
+  backend.declareResult_({ winningVent: 1, losingVent1: 2, losingVent2: 3 })
+  assert.equal(available('1092'), 900)
+
   backend.clearStoredRounds()
   assert.equal(storedRound(), null)
   assert.equal(history(), null)
   assert.equal(props.store.size, 0)
-  assert.equal(cell(scoreSheet, 2, SCORE_TOTAL), 300, 'the debited stake is not refunded by this')
+  assert.equal(available('1092'), 500, 'the banked payout went with it, back to the sheet value')
+  assert.equal(cell(scoreSheet, 2, SCORE_TOTAL), 500, 'the spreadsheet never moved')
+  assert.deepEqual(scoreSheet.writes, [])
 })
 
 // ---------- editor helpers ----------
 
-test('inspectScores reports the columns, the teams and whether the score is a formula', () => {
+test('inspectScores reports the columns, the read-only promise and the balance it works out', () => {
   const { backend, logged } = setup({
-    scoreTeams: [scoreTeam('Alpha', '1092', 500), scoreTeam('Bravo', '2424', 250)],
-    scoreFormulas: { '2,3': '=SUM(D2:W2)' },
+    scoreTeams: [scoreTeam('Alpha', '1092', 2090), scoreTeam('Bravo', '2424', 250)],
     liveBets: [['2424', 100, 4]],
   })
   backend.inspectScores()
   assert.ok(logged(/Spreadsheet: Main Spreadsheet/))
   assert.ok(logged(/Tab: "Sheet1"/))
+  assert.ok(logged(/Read-only: this script never writes to this spreadsheet\./))
   assert.ok(logged(/name: column 2 \(B\), team code: column 1 \(A\), total score: column 3 \(C\)/))
   assert.ok(logged(/Usable teams: 2/))
-  assert.ok(logged(/row 2: code="1092" name="Alpha" score=500 {2}formula==SUM\(D2:W2\)/))
-  assert.ok(logged(/row 3: code="2424" name="Bravo" score=150 {2}formula=\(none — a plain number/))
+  // Alpha: sheet 2090, nothing riding, so available is the same.
+  assert.ok(logged(/row 2: code="1092" name="Alpha" sheet=2090 {2}available=2090 {2}formula==IF\(COUNTA\(D2:W2\)/))
+  // Bravo: 250 from the sheet less the 100 it is holding.
+  assert.ok(logged(/row 3: code="2424" name="Bravo" sheet=250 {2}available=150 {2}\(stake of 100 riding this round\)/))
   assert.ok(logged(/Round 1 — 1 live bet\(s\) in script properties/))
+  assert.ok(logged(/Settled by this script so far: nothing yet\./))
+})
+
+test('inspectScores reports a banked payout as the gap between the sheet and what a team can spend', () => {
+  const { backend, logged } = setup({
+    scoreTeams: [scoreTeam('Alpha', '1092', 2090)],
+    liveBets: [['1092', 200, 1]],
+  })
+  backend.declareResult_({ winningVent: 1, losingVent1: 2, losingVent2: 3 })
+  backend.placeBet_({ teamCode: '1092', amount: 500, vent: 2 })
+  backend.inspectScores()
+  // 2090 + 400 banked - 500 riding = 1990
+  assert.ok(logged(/row 2: code="1092" name="Alpha" sheet=2090 {2}available=1990 {2}\(stake of 500 riding this round\)/))
+  assert.ok(logged(/Settled by this script so far: 1092 \+400/))
 })
 
 // ---------- transports ----------
