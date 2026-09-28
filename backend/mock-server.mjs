@@ -115,33 +115,49 @@ const properties = {
   deleteProperty: (k) => { store.delete(k) },
 }
 
+const cacheStore = new Map()
+const cache = {
+  get: (k) => (cacheStore.has(k) ? cacheStore.get(k) : null),
+  put: (k, v) => { cacheStore.set(k, String(v)) },
+  remove: (k) => { cacheStore.delete(k) },
+}
+
 const load = new Function(
   'SpreadsheetApp',
   'ContentService',
   'LockService',
   'PropertiesService',
+  'CacheService',
   'Logger',
   `${source}
   return { doGet, doPost, CONFIG };`
 )
-const api = load(
-  {
-    getActive: () => boundBook,
-    openById: () => scoreBook,
-  },
-  {
-    MimeType: { JSON: 'application/json' },
-    createTextOutput: (text) => ({ text, setMimeType() { return this } }),
-  },
-  { getScriptLock: () => ({ waitLock() {}, releaseLock() {} }) },
-  { getScriptProperties: () => properties },
-  { log: (...args) => console.log('[sheet]', ...args) }
-)
+
+// Apps Script hands every request a fresh container: the module-level caches
+// (scoreBook_, rosterCache_, scoreCols_) start empty each time, while
+// PropertiesService and CacheService are shared. Rebuilding the script per
+// request is what makes this mock show the same latency behaviour as the real
+// deployment — including what the roster cache saves.
+const newContainer = () =>
+  load(
+    {
+      getActive: () => boundBook,
+      openById: () => scoreBook,
+    },
+    {
+      MimeType: { JSON: 'application/json' },
+      createTextOutput: (text) => ({ text, setMimeType() { return this } }),
+    },
+    { getScriptLock: () => ({ waitLock() {}, releaseLock() {} }) },
+    { getScriptProperties: () => properties },
+    { getScriptCache: () => cache },
+    { log: (...args) => console.log('[sheet]', ...args) }
+  )
 
 // Seed a round through the real placeBet path, spread across the vent range so
 // a declaration has a realistic mix of winner and loser.
 for (const [code, amount, vent] of [['1092', 200, 1], ['2424', 150, 3], ['2324', 100, 5], ['4141', 75, 9]]) {
-  const out = JSON.parse(api.doPost({ postData: { contents: JSON.stringify({ action: 'placeBet', teamCode: code, amount, vent }) } }).text)
+  const out = JSON.parse(newContainer().doPost({ postData: { contents: JSON.stringify({ action: 'placeBet', teamCode: code, amount, vent }) } }).text)
   if (!out.ok) console.log('[seed] skipped', code, out.error)
 }
 
@@ -155,7 +171,7 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'GET') {
     const url = new URL(req.url, 'http://localhost')
-    const out = api.doGet({ parameter: Object.fromEntries(url.searchParams) })
+    const out = newContainer().doGet({ parameter: Object.fromEntries(url.searchParams) })
     res.writeHead(200, { ...headers, 'Content-Type': 'application/json' })
     res.end(out.text)
     return
@@ -164,7 +180,7 @@ const server = http.createServer((req, res) => {
   let body = ''
   req.on('data', (chunk) => { body += chunk })
   req.on('end', () => {
-    const out = api.doPost({ postData: { contents: body } })
+    const out = newContainer().doPost({ postData: { contents: body } })
     res.writeHead(200, { ...headers, 'Content-Type': 'application/json' })
     res.end(out.text)
   })

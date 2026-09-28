@@ -199,25 +199,119 @@ test('every request carries an AbortSignal so a hung call cannot hang the UI', a
   }
 })
 
-test('a request that outlives the timeout rejects with a friendly message', async () => {
+// ---------- the cold start ----------
+//
+// An Apps Script container is shut down when idle, so the first request after a
+// pause pays a cold start: measured at 12-15s against the live deployment while
+// a warm call is 2-3s. That is why a request is given a second attempt before
+// it is called a failure.
+
+const abortError = () => {
+  const error = new Error('The operation was aborted.')
+  error.name = 'AbortError'
+  return error
+}
+const networkError = () => {
+  const error = new Error('Failed to fetch')
+  error.name = 'TypeError'
+  return error
+}
+
+test('a request that outlives the timeout twice rejects with a friendly message', async () => {
+  let attempts = 0
   const api = createBettingApi(
     'https://script.example/exec',
-    (url, init) =>
-      new Promise((resolve, reject) => {
-        init.signal.addEventListener('abort', () => {
-          const error = new Error('The operation was aborted.')
-          error.name = 'AbortError'
-          reject(error)
-        })
-      }),
-    { timeoutMs: 25 }
+    (url, init) => {
+      attempts += 1
+      return new Promise((resolve, reject) => {
+        init.signal.addEventListener('abort', () => reject(abortError()))
+      })
+    },
+    { timeoutMs: 25, retryDelayMs: 0 }
   )
   await assert.rejects(api.getBets(), /too long|timed out/i)
+  assert.equal(attempts, 2, 'one attempt, one retry, and no more')
 })
 
-test('the default timeout is 20 seconds', () => {
-  // Apps Script routinely takes 1-3s; 20s is a ceiling, not a target.
-  assert.equal(DEFAULT_TIMEOUT_MS, 20000)
+test('a cold start is retried and the retry is what the caller sees', async () => {
+  let attempts = 0
+  const api = createBettingApi(
+    'https://script.example/exec',
+    async () => {
+      attempts += 1
+      if (attempts === 1) throw abortError()
+      return response({ ok: true, bets: [{ teamName: 'Alpha', amount: 200, vent: 1 }] })
+    },
+    { timeoutMs: 25, retryDelayMs: 0 }
+  )
+  const result = await api.getBets()
+  assert.equal(attempts, 2)
+  assert.equal(result.bets.length, 1, 'the sleeper is woken and nobody is told')
+})
+
+test('a request that never reached the server is retried too', async () => {
+  let attempts = 0
+  const api = createBettingApi(
+    'https://script.example/exec',
+    async () => {
+      attempts += 1
+      if (attempts === 1) throw networkError()
+      return response({ ok: true, activeBets: 0 })
+    },
+    { timeoutMs: 25, retryDelayMs: 0 }
+  )
+  assert.deepEqual(await api.getBets(), { activeBets: 0 })
+  assert.equal(attempts, 2)
+})
+
+test('a genuine error from the script is shown once, not retried away', async () => {
+  let attempts = 0
+  const api = createBettingApi(
+    'https://script.example/exec',
+    async () => {
+      attempts += 1
+      return response({ ok: false, error: 'Unknown team ID' })
+    },
+    { timeoutMs: 25, retryDelayMs: 0 }
+  )
+  await assert.rejects(api.getScore({ teamCode: '9999' }), /Unknown team ID/)
+  assert.equal(attempts, 1, 'a rejection is an answer, not a transport failure')
+})
+
+test('a retry that finds the bet already placed is reported as the success it is', async () => {
+  // The first attempt timed out but had already landed. placeBet refuses a
+  // second bet from the same team, so that refusal is proof the bet went in.
+  let attempts = 0
+  const api = createBettingApi(
+    'https://script.example/exec',
+    async () => {
+      attempts += 1
+      if (attempts === 1) throw abortError()
+      return response({ ok: false, error: 'This team has already placed a bet this round' })
+    },
+    { timeoutMs: 25, retryDelayMs: 0 }
+  )
+  const result = await api.placeBet({ teamCode: '1092', amount: 200, vent: 3 })
+  assert.deepEqual(result, { reconciled: true })
+  assert.equal(attempts, 2)
+})
+
+test('"already placed a bet" is still an error when nothing was retried', async () => {
+  // The user really is betting twice. The reconciliation above must not paper
+  // over a genuine second attempt.
+  const api = createBettingApi('https://script.example/exec', async () =>
+    response({ ok: false, error: 'This team has already placed a bet this round' })
+  )
+  await assert.rejects(
+    api.placeBet({ teamCode: '1092', amount: 200, vent: 3 }),
+    /already placed a bet this round/
+  )
+})
+
+test('the default timeout is long enough for a cold start', () => {
+  // Measured warm at 2-3s and cold at 12-15s on the live deployment. The old
+  // 20s ceiling failed precisely when the service was slowest.
+  assert.equal(DEFAULT_TIMEOUT_MS, 25000)
 })
 
 test('bet input validation requires team code, positive whole amount, and vent 1-9', () => {

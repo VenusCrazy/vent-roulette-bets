@@ -178,6 +178,20 @@ let scoreBook_ = null;
 let rosterCache_ = null;
 let scoreCols_ = null;
 
+// Reading the roster costs several round trips to the Sheets API: open the
+// workbook, find the tab, detect the columns from the header row, then read the
+// block. The two module-level caches above only help inside a single execution,
+// and Apps Script hands every request its own container — so a script that has
+// been idle for a minute pays the whole cost again, on top of the cold start.
+//
+// CacheService is shared across containers, so a short-lived copy there turns
+// getTeams and getScore into a single fast lookup. A placeBet deliberately
+// bypasses it: the ceiling on a bet must be judged against the sheet's current
+// numbers, not a snapshot up to ROSTER_CACHE_SECONDS old, and it is the one
+// call where a moment's staleness could let a team overspend.
+const ROSTER_CACHE_KEY = 'roster_v1';
+const ROSTER_CACHE_SECONDS = 60;
+
 function scoreSpreadsheet_() {
   if (!scoreBook_) scoreBook_ = SpreadsheetApp.openById(CONFIG.SCORE_SPREADSHEET_ID);
   return scoreBook_;
@@ -255,9 +269,29 @@ function cellText_(row, col) {
   return v === null || v === undefined ? '' : String(v);
 }
 
-/** Every team in the main spreadsheet: code, name, score and row, in sheet order. */
-function roster_() {
-  if (rosterCache_) return rosterCache_;
+/**
+ * Every team in the main spreadsheet: code, name, score and row, in sheet order.
+ * Pass { fresh: true } to skip the cross-container cache and read the sheet.
+ */
+function roster_(options) {
+  const fresh = !!(options && options.fresh);
+  if (!fresh && rosterCache_) return rosterCache_;
+
+  const cache = fresh ? null : CacheService.getScriptCache();
+  if (cache) {
+    const hit = cache.get(ROSTER_CACHE_KEY);
+    if (hit) {
+      try {
+        const parsed = JSON.parse(hit);
+        if (Array.isArray(parsed)) {
+          rosterCache_ = parsed;
+          return parsed;
+        }
+      } catch (err) {
+        // A corrupt entry is not worth failing a request over — re-read instead.
+      }
+    }
+  }
 
   const cols = scoreColumnMap_();
   const sheet = scoreSheet_();
@@ -265,6 +299,8 @@ function roster_() {
   const list = [];
 
   if (last >= CONFIG.FIRST_ROW) {
+    // Only the three columns that matter, not the whole row. The activity
+    // columns to the right are hundreds of cells this script never looks at.
     const width = Math.max(cols.name, cols.code, cols.total);
     sheet.getRange(CONFIG.FIRST_ROW, 1, last - CONFIG.FIRST_ROW + 1, width).getValues()
       .forEach((r, i) => {
@@ -280,13 +316,22 @@ function roster_() {
   }
 
   rosterCache_ = list;
+  if (cache) {
+    try {
+      cache.put(ROSTER_CACHE_KEY, JSON.stringify(list), ROSTER_CACHE_SECONDS);
+    } catch (err) {
+      // The 100KB per-value limit, on a roster far larger than that. Caching is
+      // an optimisation; a refusal to cache must never fail the request.
+      Logger.log('Could not cache the roster: ' + err.message);
+    }
+  }
   return list;
 }
 
 /** Exact match against the roster array. Returns null when the team is unknown. */
-function findTeam_(teamCode) {
+function findTeam_(teamCode, options) {
   const target = String(teamCode).trim();
-  const teams = roster_();
+  const teams = roster_(options);
   for (let i = 0; i < teams.length; i++) {
     if (teams[i].teamCode === target) return teams[i];
   }
@@ -372,14 +417,19 @@ function placeBet_(p) {
     throw new Error('Pick a vent from 1 to ' + CONFIG.VENTS);
   }
 
+  // Read the sheet BEFORE taking the lock. It is the slow part — a second or
+  // more — and holding the script lock across it would make every bet in a
+  // queue wait its turn behind a Sheets API round trip. Nothing here is shared
+  // between teams, so a stale-by-a-few-hundred-milliseconds read is harmless;
+  // the fresh flag is what guarantees the ceiling is judged against current
+  // numbers rather than a cached roster.
+  const team = findTeam_(teamCode, { fresh: true });
+  if (!team) throw new Error('Unknown team ID');
+
   const lock = LockService.getScriptLock();
   lock.waitLock(10000);
   try {
-    // 1. The team must be on the roster
-    const team = findTeam_(teamCode);
-    if (!team) throw new Error('Unknown team ID');
-
-    // 2. One bet per team per round
+    // 1. One bet per team per round
     const state = readRound_();
     for (let i = 0; i < state.b.length; i++) {
       if (String(state.b[i].c) === team.teamCode) {
@@ -387,16 +437,17 @@ function placeBet_(p) {
       }
     }
 
-    // 3. The stake cannot be more than the team can spend — the sheet's own
+    // 2. The stake cannot be more than the team can spend — the sheet's own
     //    score, plus settled payouts, minus anything already riding this round.
     const available = availableFor_(team, state);
     if (amount > available) {
       throw new Error('Bet exceeds your total score (' + available + ')');
     }
 
-    // 4. Record the bet. The stake is held in the round, not taken out of the
+    // 3. Record the bet. The stake is held in the round, not taken out of the
     //    spreadsheet, so this team's spendable points drop by `amount` from the
-    //    moment the bet lands. Both halves of that happen under one lock.
+    //    moment the bet lands. What is left under the lock is a properties
+    //    read and write — milliseconds, not seconds.
     state.b.push({ c: team.teamCode, n: team.teamName, a: amount, v: vent });
     writeRound_(state);
 
@@ -569,7 +620,7 @@ function inspectScores() {
     (cols.fromHeaders ? ' (detected from the header row)' : ' (CONFIG fallback — no matching headers)')
   );
 
-  const teams = roster_();
+  const teams = roster_({ fresh: true });
   Logger.log('Usable teams: ' + teams.length);
   teams.slice(0, 8).forEach((t) => {
     const cell = sheet.getRange(t.row, cols.total);

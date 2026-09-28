@@ -2,7 +2,7 @@
 // so it can be driven by a fake clock and a fake document — no renderer needed.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { startBetsPolling, POLL_INTERVAL_MS } from './polling.js'
+import { startBetsPolling, POLL_INTERVAL_MS, POLL_JITTER_MS } from './polling.js'
 
 // A controllable stand-in for setInterval / document.
 function makeEnv() {
@@ -51,10 +51,42 @@ test('the default interval is 15 seconds', () => {
   assert.equal(POLL_INTERVAL_MS, 15000)
 })
 
+test('clients are staggered so they do not all wake the same container at once', () => {
+  withFakeTimers((env) => {
+    const stop = startBetsPolling({ doc: env.doc, poll: () => {}, random: () => 0 })
+    assert.equal(env.timers[0].ms, POLL_INTERVAL_MS, 'the earliest a client can land')
+    stop()
+  })
+  withFakeTimers((env) => {
+    const stop = startBetsPolling({ doc: env.doc, poll: () => {}, random: () => 1 })
+    assert.equal(env.timers[0].ms, POLL_INTERVAL_MS + POLL_JITTER_MS, 'the latest')
+    stop()
+  })
+  withFakeTimers((env) => {
+    const stop = startBetsPolling({ doc: env.doc, poll: () => {}, random: () => 0.5 })
+    assert.equal(env.timers[0].ms, POLL_INTERVAL_MS + POLL_JITTER_MS / 2)
+    stop()
+  })
+})
+
+test('the stagger is fixed per client, so the interval does not drift', () => {
+  withFakeTimers((env) => {
+    const stop = startBetsPolling({ doc: env.doc, poll: () => {}, random: () => 0.5 })
+    const period = env.timers[0].ms
+    // One period, chosen once — not re-rolled on every tick, or the poll would
+    // slowly walk away from where it started.
+    env.ticks(period)
+    env.ticks(period)
+    assert.equal(env.timers.length, 1)
+    assert.equal(env.timers[0].ms, period)
+    stop()
+  })
+})
+
 test('fetches once immediately on start', () => {
   withFakeTimers((env) => {
     const calls = []
-    const stop = startBetsPolling({ doc: env.doc, poll: () => calls.push('poll') })
+    const stop = startBetsPolling({ doc: env.doc, jitterMs: 0, poll: () => calls.push('poll') })
     assert.deepEqual(calls, ['poll'])
     stop()
   })
@@ -63,7 +95,7 @@ test('fetches once immediately on start', () => {
 test('polls on every interval tick while the tab is visible', () => {
   withFakeTimers((env) => {
     const calls = []
-    const stop = startBetsPolling({ doc: env.doc, poll: () => calls.push('poll') })
+    const stop = startBetsPolling({ doc: env.doc, jitterMs: 0, poll: () => calls.push('poll') })
     env.ticks(POLL_INTERVAL_MS)
     env.ticks(POLL_INTERVAL_MS)
     assert.deepEqual(calls, ['poll', 'poll', 'poll'], 'initial + two ticks')
@@ -74,7 +106,7 @@ test('polls on every interval tick while the tab is visible', () => {
 test('does not poll on a tick while the tab is hidden', () => {
   withFakeTimers((env) => {
     const calls = []
-    const stop = startBetsPolling({ doc: env.doc, poll: () => calls.push('poll') })
+    const stop = startBetsPolling({ doc: env.doc, jitterMs: 0, poll: () => calls.push('poll') })
     env.hidden = true
     env.ticks(POLL_INTERVAL_MS)
     env.ticks(POLL_INTERVAL_MS)
@@ -86,7 +118,7 @@ test('does not poll on a tick while the tab is hidden', () => {
 test('resumes polling on later ticks once the tab is visible again', () => {
   withFakeTimers((env) => {
     const calls = []
-    const stop = startBetsPolling({ doc: env.doc, poll: () => calls.push('poll') })
+    const stop = startBetsPolling({ doc: env.doc, jitterMs: 0, poll: () => calls.push('poll') })
     env.hidden = true
     env.ticks(POLL_INTERVAL_MS)
     env.hidden = false
@@ -99,7 +131,7 @@ test('resumes polling on later ticks once the tab is visible again', () => {
 test('becoming visible fetches immediately instead of waiting for a tick', () => {
   withFakeTimers((env) => {
     const calls = []
-    const stop = startBetsPolling({ doc: env.doc, poll: () => calls.push('poll') })
+    const stop = startBetsPolling({ doc: env.doc, jitterMs: 0, poll: () => calls.push('poll') })
     env.hidden = true
     env.listeners.get('visibilitychange')()
     assert.deepEqual(calls, ['poll'], 'staying hidden does not fetch')
@@ -114,7 +146,12 @@ test('becoming visible fetches immediately instead of waiting for a tick', () =>
 test('a custom interval is honoured', () => {
   withFakeTimers((env) => {
     const calls = []
-    const stop = startBetsPolling({ doc: env.doc, poll: () => calls.push('poll'), intervalMs: 1000 })
+    const stop = startBetsPolling({
+      doc: env.doc,
+      jitterMs: 0,
+      poll: () => calls.push('poll'),
+      intervalMs: 1000,
+    })
     env.ticks(1000)
     env.ticks(POLL_INTERVAL_MS)
     assert.deepEqual(calls, ['poll', 'poll'], 'only the 1s tick fired')
@@ -125,7 +162,7 @@ test('a custom interval is honoured', () => {
 test('stop clears the interval and detaches the listener', () => {
   withFakeTimers((env) => {
     const calls = []
-    const stop = startBetsPolling({ doc: env.doc, poll: () => calls.push('poll') })
+    const stop = startBetsPolling({ doc: env.doc, jitterMs: 0, poll: () => calls.push('poll') })
 
     assert.equal(env.timers.length, 1)
     assert.equal(env.listeners.has('visibilitychange'), true)

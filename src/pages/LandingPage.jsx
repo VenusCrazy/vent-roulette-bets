@@ -7,7 +7,7 @@ import { getScore, placeBet } from '../api/betting.js'
 import amongus from '../assets/amonguscharacter.png'
 
 export default function LandingPage() {
-  const { round, totalPoints, activeBets, bets, loading, error, refresh } = useBets()
+  const { round, totalPoints, activeBets, bets, loading, error, loaded, refresh } = useBets()
 
   async function handlePlaceBet(bet) {
     const data = await placeBet(bet)
@@ -74,13 +74,21 @@ export default function LandingPage() {
             </button>
           </header>
           <div className="p-5">
-            {error ? (
+            {/* An alarm only when there is nothing to show. A timed-out refresh
+                on top of a board that is already on screen is background noise,
+                and Apps Script's cold starts make it routine. */}
+            {error && !loaded ? (
               <div
                 role="alert"
                 className="mb-4 rounded-xl border border-flame/40 bg-flame/10 px-4 py-3 text-sm text-red-300"
               >
                 ⚠️ {error}
               </div>
+            ) : null}
+            {error && loaded ? (
+              <p className="mb-4 text-xs text-slate-400">
+                Couldn&apos;t reach the service just now — showing the last board it sent.
+              </p>
             ) : null}
             <BetsTable bets={bets} loading={loading} />
           </div>

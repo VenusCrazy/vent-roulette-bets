@@ -8,13 +8,17 @@ const EMPTY_STATS = { round: null, totalPoints: 0, activeBets: 0 }
  * Polls getBets on mount and every 15s, pausing while the tab is hidden.
  *
  * A failed refresh keeps the last good data on screen and reports the error
- * alongside it, so a blip never blanks the list someone is reading.
+ * alongside it, so a blip never blanks the list someone is reading. `loaded`
+ * says whether a refresh has ever succeeded, which is what separates "the board
+ * is broken and you are looking at nothing" from "the board is fine but the last
+ * refresh timed out" — only the first deserves an alarm.
  */
 export default function useBets({ intervalMs } = {}) {
   const [bets, setBets] = useState([])
   const [stats, setStats] = useState(EMPTY_STATS)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [loaded, setLoaded] = useState(false)
 
   // A poll still in flight when the next one fires would queue up behind Apps
   // Script's 1-3s latency, so overlapping requests are dropped rather than
@@ -35,6 +39,7 @@ export default function useBets({ intervalMs } = {}) {
         activeBets: data?.activeBets ?? 0,
       })
       setError('')
+      setLoaded(true)
     } catch (err) {
       // setBets is deliberately untouched here: stale data beats an empty list.
       if (mounted.current) setError(err?.message ?? 'Could not refresh bets.')
@@ -56,5 +61,5 @@ export default function useBets({ intervalMs } = {}) {
     }
   }, [refresh, intervalMs])
 
-  return { ...stats, bets, loading, error, refresh }
+  return { ...stats, bets, loading, error, loaded, refresh }
 }

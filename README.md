@@ -91,6 +91,10 @@ and no `Config` sheet any more:
 - `history_v1` — finished rounds, trimmed to fit the 9KB limit PropertiesService puts on a
   single value, oldest dropped first.
 
+The roster is cached separately in `CacheService` for 60 seconds, because it is the one
+thing that costs a spreadsheet round trip. See
+[Why the site sometimes feels slow](#why-the-site-sometimes-feels-slow).
+
 Both are only ever touched under the script lock.
 
 ### How points move
@@ -174,14 +178,59 @@ in `src/api/betting.js` handles this:
 - No custom headers are sent, and `mode` is left at its default so the response stays
   readable. (`no-cors` would make the response opaque.)
 - `GET` appends a timestamp, since Apps Script caches aggressively behind a CDN.
-- Every request has a 20s `AbortController` timeout, so a hung call cannot leave the UI
-  spinning forever.
 - Apps Script replies with **HTTP 200 even when something failed**, so success is decided by
   `data.ok`, never by `response.ok`. Failures carry `{ ok: false, error: "..." }` and that
   message is shown to the user verbatim.
 
 In the network tab, placing a bet should show a single `POST` with **no `OPTIONS` request
 above it**.
+
+### Why the site sometimes feels slow
+
+An Apps Script web app runs on a container that is **shut down when it sits idle**, so the
+first request after a pause pays a cold start on top of the work. Measured against the live
+deployment:
+
+| Call | Warm | Cold |
+| --- | --- | --- |
+| `getBets` (no spreadsheet access) | ~2.2s | **12.5s** |
+| `getTeams` | ~2.9s | — |
+| `getScore` | ~3.2s | — |
+
+Three things follow from that, and all three are in the code:
+
+- **The timeout is 25s, and a request is retried once.** A cold start that overruns the
+  ceiling is retried after a second, because a sleeping container is the most predictable
+  failure there is. The old 20s ceiling failed exactly when the service was slowest.
+  A retry after a timeout on `placeBet` that comes back *"already placed a bet this round"*
+  is reported as the success it is: the script refuses a second bet per team per round, so
+  that answer is proof the first attempt got through.
+- **A failed background poll does not raise an alarm.** `useBets` keeps the last good board
+  on screen and reports `loaded`, so a timed-out refresh on top of a correct board shows a
+  muted one-liner instead of a red banner. A red alert is reserved for having nothing to show.
+- **The roster is cached across containers, but a bet never is.** Reading it costs several
+  Sheets round trips, and the module-level cache dies with the container, so `roster_()` also
+  uses `CacheService` for 60 seconds. `getTeams` and `getScore` are therefore served from
+  cache. **`placeBet` deliberately bypasses it** (`roster_({ fresh: true })`) so the ceiling
+  is judged against the sheet's current numbers and a team cannot overspend against a
+  snapshot. It also reads the sheet *before* taking the script lock, so a queue of teams is
+  not serialised behind the Sheets API — the lock is held only for a properties read and
+  write, milliseconds rather than seconds.
+- **The poll interval is staggered by up to 7s per client.** Every tab on every device polling
+  on the same 15s boundary arrives at the same asleep container at the same moment.
+
+> If the site stays slow even when warm, the account is on Apps Script's free tier, where
+> containers are aggressively recycled. A Workspace account removes the cold starts; nothing
+> in this codebase can.
+
+### Troubleshooting timeouts
+
+| Symptom | Cause |
+| --- | --- |
+| *"took too long to respond"* after ~25s, on a first load | A cold start that outlived one retry. Try again — the second attempt finds the container awake. |
+| *"did not return valid JSON"* | The request hit Google's rate limiter or a login page. This endpoint is public; it fails if it is deployed **Execute as: Me** with access **Only myself**. |
+| The board is correct but shows *"Couldn't reach the service just now"* | One background poll timed out. Nothing is wrong; the next one replaces it. |
+| Betting works, the roster is empty | `CONFIG.SCORE_SPREADSHEET_ID` or `CONFIG.SCORE_SHEET` no longer match. Run `inspectScores()` and read the log. |
 
 ## Layout
 

@@ -28,9 +28,25 @@ export function validateBetInput({ teamCode, amount, vent, maxPoints }) {
   return ''
 }
 
-// Apps Script can take a few seconds per call; 20s is a ceiling that stops a
-// hung request from pinning the UI in a permanent spinner, not a target.
-const DEFAULT_TIMEOUT_MS = 20000
+// An Apps Script web app runs on a container that is shut down when it sits
+// idle, so the first call after a pause pays for a cold start on top of the
+// work. Measured against the live deployment: 2-3s warm, 12-15s cold. The old
+// 20s ceiling therefore failed exactly when the service was slowest, which is
+// backwards. 25s leaves room for a cold start; RETRY_BELOW catches the rest.
+const DEFAULT_TIMEOUT_MS = 25000
+
+// A cold start is transient by nature, so one retry is worth far more than the
+// extra request costs. Long enough that a container still spinning up has
+// finished, short enough that nobody is still staring at the button.
+const RETRY_DELAY_MS = 1000
+const TIMEOUT_MESSAGE = 'The betting service took too long to respond — please try again'
+
+// placeBet is idempotent per team per round: the script refuses a second bet
+// from the same team, so a retry can never record the same stake twice. That
+// makes retrying a bet safe — and it means "already placed a bet this round"
+// coming back from a retry is proof the first attempt got through, not a
+// failure to report.
+const ALREADY_BETTED = /already placed a bet/i
 
 const NETWORK_ERROR = 'Network error, please try again'
 const INVALID_JSON_ERROR =
@@ -47,28 +63,48 @@ function buildUrl(baseUrl, action, params = {}) {
 export { DEFAULT_TIMEOUT_MS }
 
 export function createBettingApi(baseUrl, fetchImpl = globalThis.fetch, options = {}) {
-  const { timeoutMs = DEFAULT_TIMEOUT_MS } = options
+  const { timeoutMs = DEFAULT_TIMEOUT_MS, retryDelayMs = RETRY_DELAY_MS } = options
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+  // One fetch, with its own abort timer. A retry needs a fresh controller: the
+  // first one is already aborted, and reusing it would abort the retry instantly.
+  async function attempt(url, init) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+      return await fetchImpl(url, { ...init, signal: controller.signal })
+    } finally {
+      clearTimeout(timer)
+    }
+  }
 
   async function request(url, init) {
     if (!baseUrl) {
       throw new Error('VITE_APPS_SCRIPT_URL is not set — add it to .env')
     }
 
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), timeoutMs)
-
     let response
+    let retried = false
     try {
-      response = await fetchImpl(url, { ...init, signal: controller.signal })
+      response = await attempt(url, init)
     } catch (error) {
-      if (error?.name === 'AbortError') {
-        throw new Error('The betting service took too long to respond — please try again', {
-          cause: error,
-        })
+      // AbortError is our own timeout. TypeError is fetch's way of saying the
+      // request never reached the server. Both are worth one more go; anything
+      // else is a bug in the caller and retrying would only hide it.
+      const transient = error?.name === 'AbortError' || error?.name === 'TypeError'
+      if (!transient) throw new Error(NETWORK_ERROR, { cause: error })
+
+      await sleep(retryDelayMs)
+      retried = true
+      try {
+        response = await attempt(url, init)
+      } catch (retryError) {
+        throw new Error(
+          retryError?.name === 'AbortError' ? TIMEOUT_MESSAGE : NETWORK_ERROR,
+          { cause: retryError }
+        )
       }
-      throw new Error(NETWORK_ERROR, { cause: error })
-    } finally {
-      clearTimeout(timer)
     }
 
     let payload
@@ -82,7 +118,17 @@ export function createBettingApi(baseUrl, fetchImpl = globalThis.fetch, options 
     // trustworthy success signal. `response.ok` is checked too, for the
     // redirect/HTML cases a misconfigured deployment produces.
     if (!response.ok || payload?.ok !== true) {
-      throw new Error(payload?.error || `Betting service request failed (HTTP ${response.status})`)
+      const message = payload?.error || `Betting service request failed (HTTP ${response.status})`
+      if (retried && init?.method === 'POST' && ALREADY_BETTED.test(message)) {
+        // The bet landed on the attempt that timed out, and the retry was
+        // turned away because the team has already bet. That is a success, and
+        // the honest thing to say: the only figure we cannot quote is what is
+        // left, so the form falls back to its plain confirmation.
+        return { reconciled: true }
+      }
+      // A real response came back this time, so its error is the true one and
+      // is surfaced verbatim.
+      throw new Error(message)
     }
 
     return Object.fromEntries(Object.entries(payload).filter(([key]) => key !== 'ok'))

@@ -42,7 +42,15 @@ class FakeRange {
     while (this.sheet.data[r - 1].length <= c - 1) this.sheet.data[r - 1].push('')
     this.sheet.data[r - 1][c - 1] = v
   }
+  // Every read is counted, so a test can prove a call was served from the cache
+  // rather than by hitting the Sheets API again. `sheet.lockProbe` lets a test
+  // see whether a read happened while the script lock was held.
+  _countRead() {
+    this.sheet.reads += 1
+    if (this.sheet.lockProbe && this.sheet.lockProbe()) this.sheet.readsWhileLocked += 1
+  }
   getValues() {
+    this._countRead()
     const out = []
     for (let r = 0; r < this.numRows; r++) {
       const row = []
@@ -52,6 +60,7 @@ class FakeRange {
     return out
   }
   getValue() {
+    this._countRead()
     return this._read(this.row, this.col)
   }
   // Real Sheets drops a formula when a plain value is written over it, and the
@@ -91,6 +100,10 @@ class FakeSheet {
     this.formulas = new Map()
     // Every cell this fake was written to. The main spreadsheet must stay empty.
     this.writes = []
+    // Read counters, so caching can be asserted rather than assumed.
+    this.reads = 0
+    this.readsWhileLocked = 0
+    this.lockProbe = null
   }
   getName() {
     return this.name
@@ -163,6 +176,34 @@ class FakeProperties {
   }
 }
 
+// ---------- fake CacheService ----------
+
+// Real CacheService is shared across containers, which is exactly why the script
+// uses it: a fresh one per setup() keeps tests isolated while still exercising
+// the cross-request path inside a single test.
+class FakeCache {
+  constructor() {
+    this.store = new Map()
+    this.hits = 0
+    this.misses = 0
+  }
+  get(key) {
+    if (!this.store.has(key)) {
+      this.misses += 1
+      return null
+    }
+    this.hits += 1
+    return this.store.get(key)
+  }
+  put(key, value, _seconds) {
+    if (String(value).length > 100000) throw new Error('Value is too large')
+    this.store.set(key, String(value))
+  }
+  remove(key) {
+    this.store.delete(key)
+  }
+}
+
 // ---------- fixtures ----------
 
 const cell = (sheet, row, col) => sheet.data[row - 1]?.[col - 1]
@@ -209,6 +250,7 @@ function setup({
   )
 
   const props = new FakeProperties()
+  const cache = new FakeCache()
   const logs = []
   const opened = []
   let lockDepth = 0
@@ -219,38 +261,51 @@ function setup({
     'ContentService',
     'LockService',
     'PropertiesService',
+    'CacheService',
     'Logger',
     `${source}
     return { getBets_, getTeams_, getScore_, placeBet_, declareResult_, resetRound_,
              handleBettingAction_, inspectScores, clearStoredRounds, doGet, doPost, CONFIG };`
   )
 
-  const backend = load(
-    {
-      getActive: () => boundBook,
-      openById: (id) => {
-        opened.push(id)
-        return scoreBook
+  // Loading the source is what standing up a container is: the module-level
+  // caches (scoreBook_, rosterCache_, scoreCols_) start empty every time, while
+  // PropertiesService and CacheService are shared — exactly as they are across
+  // real Apps Script requests. newContainer() lets a test model the next
+  // request, which is the only way caching between requests can be observed.
+  const newContainer = () =>
+    load(
+      {
+        getActive: () => boundBook,
+        openById: (id) => {
+          opened.push(id)
+          return scoreBook
+        },
       },
-    },
-    {
-      MimeType: { JSON: 'application/json' },
-      createTextOutput: (text) => ({ text, setMimeType() { return this } }),
-    },
-    {
-      getScriptLock: () => ({
-        waitLock() {
-          lockDepth += 1
-          maxLockDepth = Math.max(maxLockDepth, lockDepth)
-        },
-        releaseLock() {
-          lockDepth -= 1
-        },
-      }),
-    },
-    { getScriptProperties: () => props },
-    { log: (...args) => logs.push(args.map(String).join(' ')) }
-  )
+      {
+        MimeType: { JSON: 'application/json' },
+        createTextOutput: (text) => ({ text, setMimeType() { return this } }),
+      },
+      {
+        getScriptLock: () => ({
+          waitLock() {
+            lockDepth += 1
+            maxLockDepth = Math.max(maxLockDepth, lockDepth)
+          },
+          releaseLock() {
+            lockDepth -= 1
+          },
+        }),
+      },
+      { getScriptProperties: () => props },
+      { getScriptCache: () => cache },
+      { log: (...args) => logs.push(args.map(String).join(' ')) }
+    )
+
+  const backend = newContainer()
+
+  // Let the fake sheet report whether a read happened under the script lock.
+  scoreSheet.lockProbe = () => lockDepth > 0
 
   // Seed the round through the real placeBet path, so the debit is genuine.
   for (const [code, amount, vent] of liveBets) {
@@ -270,10 +325,13 @@ function setup({
 
   return {
     backend,
+    /** A fresh container sharing the same properties and cache: the next request. */
+    newContainer,
     scoreSheet,
     scoreBook,
     boundBook,
     props,
+    cache,
     logs,
     logged,
     history,
@@ -892,6 +950,81 @@ test('inspectScores reports a banked payout as the gap between the sheet and wha
   // 2090 + 400 banked - 500 riding = 1990
   assert.ok(logged(/row 2: code="1092" name="Alpha" sheet=2090 {2}available=1990 {2}\(stake of 500 riding this round\)/))
   assert.ok(logged(/Settled by this script so far: 1092 \+400/))
+})
+
+// ---------- latency: the reads people actually wait on ----------
+
+test('getTeams and getScore are served from the cross-container cache, not the sheet', () => {
+  const { newContainer, scoreSheet, cache } = setup({
+    scoreTeams: [scoreTeam('Alpha', '1092', 500), scoreTeam('Bravo', '2424', 400)],
+  })
+
+  // Request 1 pays for the sheet.
+  const first = newContainer().getTeams_({})
+  const readsAfterFirst = scoreSheet.reads
+  assert.ok(readsAfterFirst > 0, 'the first request does read the sheet')
+
+  // Requests 2-4 are each a brand new container, and none of them touch it.
+  for (let i = 0; i < 3; i++) {
+    const backend = newContainer()
+    backend.getTeams_({})
+    backend.getScore_({ teamCode: '1092' })
+    backend.getTeams_({ q: 'bra' })
+  }
+  assert.equal(scoreSheet.reads, readsAfterFirst, 'later requests cost no Sheets calls at all')
+  assert.equal(cache.hits, 3, 'all three came from CacheService')
+  assert.deepEqual(
+    newContainer().getTeams_({}).teams.map((t) => t.totalScore),
+    first.teams.map((t) => t.totalScore)
+  )
+})
+
+test('a cached roster is used until it expires, then the sheet is read again', () => {
+  const { newContainer, scoreSheet, cache } = setup({ scoreTeams: [scoreTeam('Alpha', '1092', 500)] })
+  assert.equal(newContainer().getScore_({ teamCode: '1092' }).totalScore, 500)
+
+  // Another script records an activity result, so the sheet's formula moves.
+  scoreSheet.data[1][SCORE_TOTAL - 1] = 750
+  assert.equal(newContainer().getScore_({ teamCode: '1092' }).totalScore, 500, 'served from the cache')
+
+  // What the 60s TTL does when it runs out.
+  cache.store.clear()
+  assert.equal(newContainer().getScore_({ teamCode: '1092' }).totalScore, 750, 'and fresh once it expires')
+})
+
+test('a bet is judged against the current sheet, never a cached roster', () => {
+  const { newContainer, scoreSheet } = setup({ scoreTeams: [scoreTeam('Alpha', '1092', 500)] })
+  assert.equal(newContainer().getScore_({ teamCode: '1092' }).totalScore, 500)
+
+  // The other script records a result between the lookup and the bet.
+  scoreSheet.data[1][SCORE_TOTAL - 1] = 100
+
+  // A cached roster would still say 500 and wave a 400 bet through.
+  assert.throws(() => newContainer().placeBet_({ teamCode: '1092', amount: 400, vent: 1 }), /exceeds/)
+  assert.equal(newContainer().getScore_({ teamCode: '1092' }).totalScore, 500, 'the cache was not consulted')
+
+  assert.equal(newContainer().placeBet_({ teamCode: '1092', amount: 100, vent: 1 }).ok, true)
+})
+
+test('a bet never holds the script lock while it waits on the spreadsheet', () => {
+  const { backend, scoreSheet } = setup({ scoreTeams: [scoreTeam('Alpha', '1092', 500)] })
+  scoreSheet.readsWhileLocked = 0
+  backend.placeBet_({ teamCode: '1092', amount: 100, vent: 1 })
+  assert.equal(
+    scoreSheet.readsWhileLocked,
+    0,
+    'the sheet is read before the lock, so a queue of teams is not serialised behind Sheets'
+  )
+})
+
+test('an oversized roster is still served when the cache refuses to hold it', () => {
+  // CacheService caps a single value at 100KB. A roster that big must not fail
+  // the request just because it could not be cached.
+  const many = Array.from({ length: 6000 }, (_, i) => scoreTeam(`Team ${i}`, `code${i}`, 100))
+  const { backend, cache } = setup({ scoreTeams: many })
+  const teams = backend.getTeams_({})
+  assert.equal(teams.teams.length, 6000)
+  assert.equal(cache.store.size, 0, 'nothing was cached')
 })
 
 // ---------- transports ----------
