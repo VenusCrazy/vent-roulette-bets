@@ -401,7 +401,7 @@ test('getBets on a fresh install is an empty round 1, and touches no spreadsheet
     activeBets: 0,
     round: 1,
   })
-  assert.deepEqual(opened, [], 'the 15s poll costs no Sheets read')
+  assert.deepEqual(opened, [], 'the poll costs no Sheets read')
 })
 
 test('getBets reports the live bets, the total and the round number', () => {

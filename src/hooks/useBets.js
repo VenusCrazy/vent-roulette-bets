@@ -5,7 +5,8 @@ import { startBetsPolling } from './polling.js'
 const EMPTY_STATS = { round: null, totalPoints: 0, activeBets: 0 }
 
 /**
- * Polls getBets on mount and every 15s, pausing while the tab is hidden.
+ * Polls getBets on mount and every 2-4s, pausing while the tab is hidden and
+ * backing off if the service starts refusing.
  *
  * A failed refresh keeps the last good data on screen and reports the error
  * alongside it, so a blip never blanks the list someone is reading. `loaded`
@@ -27,22 +28,30 @@ export default function useBets({ intervalMs } = {}) {
   const mounted = useRef(true)
 
   const refresh = useCallback(async () => {
-    if (inFlight.current) return
+    // A tick that arrives while the last one is still running is dropped, and
+    // that is not a failure — reporting it as one would back the poll off for
+    // being busy rather than for being broken.
+    if (inFlight.current) return true
     inFlight.current = true
     try {
       const data = await getBets()
-      if (!mounted.current) return
-      setBets(Array.isArray(data?.bets) ? data.bets : [])
-      setStats({
-        round: Number.isInteger(data?.round) ? data.round : null,
-        totalPoints: data?.totalPoints ?? 0,
-        activeBets: data?.activeBets ?? 0,
-      })
-      setError('')
-      setLoaded(true)
+      if (mounted.current) {
+        setBets(Array.isArray(data?.bets) ? data.bets : [])
+        setStats({
+          round: Number.isInteger(data?.round) ? data.round : null,
+          totalPoints: data?.totalPoints ?? 0,
+          activeBets: data?.activeBets ?? 0,
+        })
+        setError('')
+        setLoaded(true)
+      }
+      // The return value is what the poller uses to decide whether the service
+      // is healthy, so it is reported even for an unmounted component.
+      return true
     } catch (err) {
       // setBets is deliberately untouched here: stale data beats an empty list.
       if (mounted.current) setError(err?.message ?? 'Could not refresh bets.')
+      return false
     } finally {
       inFlight.current = false
       if (mounted.current) setLoading(false)

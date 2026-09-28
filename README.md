@@ -216,8 +216,22 @@ Three things follow from that, and all three are in the code:
   snapshot. It also reads the sheet *before* taking the script lock, so a queue of teams is
   not serialised behind the Sheets API — the lock is held only for a properties read and
   write, milliseconds rather than seconds.
-- **The poll interval is staggered by up to 7s per client.** Every tab on every device polling
-  on the same 15s boundary arrives at the same asleep container at the same moment.
+- **The poll interval is 2–4s.** A bet should show up on everyone's board while the round is
+  still being argued about. It also keeps the container awake, which is the other half of why
+  the site used to feel slow after a pause. Each client adds up to 2s of jitter so tabs do not
+  land on the same instant.
+- **Failures back the poll off.** Consecutive failures double the period — 2s, 8s, 16s, 30s,
+  where it stops — and a single success puts it straight back to 2–4s. Polling hard into a
+  throttle is a spiral, since every refusal is another request that invites the next one.
+  Switching back to the tab polls at once rather than waiting out a backed-off period.
+
+> **On quotas:** the current published Apps Script quotas do *not* include a
+> executions-per-minute cap for web app calls; the documented ceilings are 6 minutes of runtime
+> per execution and 30 simultaneous executions per user. What is real is throttling in
+> practice — hammering the endpoint does get refused, which is what the backoff above is
+> there for. At 2–4s a single open tab is roughly 20 requests a minute, well inside 30
+> concurrent. If the board starts refusing while several tabs are open, close the extras; the
+> backoff will recover on its own.
 
 > If the site stays slow even when warm, the account is on Apps Script's free tier, where
 > containers are aggressively recycled. A Workspace account removes the cold starts; nothing
@@ -236,7 +250,7 @@ Three things follow from that, and all three are in the code:
 
 | Path | Purpose |
 | --- | --- |
-| `/` | Place bets (the entered Team ID's score is looked up and shown), see total and active bets, current round's bets (polls every 15s) |
+| `/` | Place bets (the entered Team ID's score is looked up and shown), see total and active bets, current round's bets (polls every 2–4s) |
 | `/admin` | Declare the round result and settle payouts; refresh (archive & clear) the round |
 
 ## Commands
